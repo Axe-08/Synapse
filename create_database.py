@@ -1,4 +1,4 @@
-# create_database.py (Live Monitoring Version)
+# create_database.py (Stage-Centric Pipeline Version)
 import sqlite3
 import requests
 import logging
@@ -9,9 +9,14 @@ from datetime import datetime
 # --- Configuration ---
 DB_NAME = 'progress.db'
 API_URL = "https://codeforces.com/api/problemset.problems"
-# This defines how many problems our pipeline can process concurrently.
-# A good starting point is the number of CPU cores you have.
-WORKER_COUNT = 2 
+
+# --- NEW: Worker Pool Configuration ---
+# This defines the concurrency for each stage of our pipeline.
+INGESTION_WORKER_COUNT = 1
+ARL_WORKER_COUNT = 4 # Tuned for network-bound tasks
+VJS_WORKER_COUNT = 2 # Tuned for CPU-bound tasks
+TOTAL_WORKER_COUNT = INGESTION_WORKER_COUNT + ARL_WORKER_COUNT + VJS_WORKER_COUNT
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Main Problems Table Schema ---
@@ -23,7 +28,8 @@ CREATE TABLE IF NOT EXISTS problems (
     name TEXT NOT NULL,
     rating INTEGER,
     tags TEXT,
-    status TEXT NOT NULL DEFAULT 'pending',
+    -- KEY CHANGE: The default status is now the first stage of our pipeline.
+    status TEXT NOT NULL DEFAULT 'pending_ingestion',
     pretest_count INTEGER DEFAULT 0,
     retry_count INTEGER DEFAULT 0,
     notes TEXT,
@@ -31,10 +37,12 @@ CREATE TABLE IF NOT EXISTS problems (
 );
 """
 
-# --- NEW: Live Workers Table Schema ---
+# --- Live Workers Table Schema ---
 CREATE_WORKERS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS live_workers (
     worker_id INTEGER PRIMARY KEY,
+    -- KEY CHANGE: Tracks which pool the worker belongs to.
+    pool TEXT NOT NULL, 
     problem_id TEXT,
     stage TEXT,
     status TEXT NOT NULL DEFAULT 'idle',
@@ -78,13 +86,25 @@ def populate_problems_table(cursor):
         logging.error(f"Failed to bulk insert problems: {e}")
         return False
 
-def initialize_workers_table(cursor, worker_count):
-    """Sets up the initial rows for the workers."""
-    logging.info(f"Initializing {worker_count} worker slots in the 'live_workers' table...")
+def initialize_workers_table(cursor):
+    """Sets up the initial rows for all workers across all pools."""
+    logging.info(f"Initializing {TOTAL_WORKER_COUNT} total worker slots in 'live_workers' table...")
     timestamp = datetime.now().isoformat()
-    workers = [(i, 'idle', timestamp) for i in range(1, worker_count + 1)]
+    workers = []
+    worker_id_counter = 1
+    
+    for _ in range(INGESTION_WORKER_COUNT):
+        workers.append((worker_id_counter, 'INGESTION', 'idle', timestamp))
+        worker_id_counter += 1
+    for _ in range(ARL_WORKER_COUNT):
+        workers.append((worker_id_counter, 'ARL', 'idle', timestamp))
+        worker_id_counter += 1
+    for _ in range(VJS_WORKER_COUNT):
+        workers.append((worker_id_counter, 'VJS', 'idle', timestamp))
+        worker_id_counter += 1
+        
     try:
-        cursor.executemany("INSERT OR REPLACE INTO live_workers (worker_id, status, last_heartbeat) VALUES (?, ?, ?)", workers)
+        cursor.executemany("INSERT OR REPLACE INTO live_workers (worker_id, pool, status, last_heartbeat) VALUES (?, ?, ?, ?)", workers)
         logging.info("Worker slots initialized successfully.")
     except sqlite3.Error as e:
         logging.error(f"Failed to initialize worker slots: {e}")
@@ -118,7 +138,7 @@ def main():
         cursor.execute(CREATE_WORKERS_TABLE_SQL)
         
         if populate_problems_table(cursor):
-            initialize_workers_table(cursor, WORKER_COUNT)
+            initialize_workers_table(cursor)
             conn.commit()
             logging.info("Database setup and population complete.")
         else:

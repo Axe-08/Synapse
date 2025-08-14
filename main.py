@@ -1,31 +1,39 @@
-# main.py (Thread-Safe Orchestrator)
+# main.py (The Final, Stabilized Factory Manager)
 import argparse
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import os
-import re
 from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading # <<< CHANGE 1: Import threading
 
-# --- Configuration ---
-WORKER_COUNT = 4 
+# --- Configuration & Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Module Imports ---
 from synapse.database import (
-    get_problems_by_ids, update_problem_on_success, update_problem_on_failure, 
-    get_next_pending_problems, update_worker_status, reset_all_workers_to_idle
+    get_next_jobs,
+    update_problem_status_to_pending_arl,
+    update_problem_status_to_failed,
+    update_worker_status,
+    reset_all_workers_to_idle
 )
 from synapse.scraper import get_authenticated_driver, fetch_problem_data
 from synapse.data_manager import append_to_dataset
+from create_database import INGESTION_WORKER_COUNT, ARL_WORKER_COUNT, VJS_WORKER_COUNT
 
-# --- Constants & Globals ---
+# Selenium imports for the warm-up wait
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+
+# Load environment variables to get CF_HANDLE
+load_dotenv()
+CF_HANDLE = os.getenv('CF_HANDLE')
+
+# --- Data Assembly Helpers ---
 PROBLEM_URL_TEMPLATE = "https://codeforces.com/problemset/problem/{contestId}/{index}"
 SUBMISSION_URL_TEMPLATE = "https://codeforces.com/contest/{contestId}/submission/{submissionId}"
-UC_INIT_LOCK = threading.Lock() # <<< CHANGE 2: Create a global lock
 
-# --- Helper Functions for Data Assembly (no changes here) ---
 def _parse_time_limit(text: str) -> int:
     try: return int(float(text.split()[0]) * 1000)
     except: return 0
@@ -55,94 +63,126 @@ def _assemble_golden_record(scraped_data: dict) -> dict:
             "author_rating": ref['author'].get('rating', None),
             "language": ref['programmingLanguage'], "code": scraped_data['solution_code']
         },
-        "verified_pseudocode": None, "verified_solution_code": None
+        "verified_pseudocode": None,
+        "verified_solution_code": None
     }
 
-# --- This is the function each worker thread will execute ---
-def process_single_problem(problem: dict, worker_id: int):
+# --- Specialized Worker Functions ---
+
+def ingestion_worker(problem: dict, worker_id: int):
+    """Worker for Stage 1: Fetches all raw data for a problem."""
     problem_id = problem['id']
     driver = None
-    
     try:
         update_worker_status(worker_id, problem_id, 'INITIALIZING', 'active')
-        
-        # <<< CHANGE 3: Use the lock to make browser creation thread-safe
-        with UC_INIT_LOCK:
-            logging.info(f"Worker {worker_id} acquiring lock to initialize browser...")
-            driver = get_authenticated_driver()
-            logging.info(f"Worker {worker_id} initialized browser and released lock.")
-        
-        if not driver:
-            raise Exception("Failed to initialize authenticated browser session.")
+        driver = get_authenticated_driver()
+        if not driver: raise Exception("Failed to initialize browser.")
+
+        # --- KEY ADDITION: Session Warm-up ---
+        if CF_HANDLE:
+            update_worker_status(worker_id, problem_id, 'WARM-UP', 'active')
+            logging.info(f"Worker {worker_id}: Warming up session...")
+            driver.get(f"https://codeforces.com/profile/{CF_HANDLE}")
+            WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.LINK_TEXT, CF_HANDLE)))
+            logging.info(f"Worker {worker_id}: Session stabilized.")
+        # ------------------------------------
 
         update_worker_status(worker_id, problem_id, 'SCRAPING', 'active')
         scraped_data = fetch_problem_data(problem_id, driver)
-        if not scraped_data:
-            raise Exception("Scraper returned no data.")
+        if not scraped_data: raise Exception("Scraper returned no data.")
 
         update_worker_status(worker_id, problem_id, 'SAVING', 'active')
         final_record = _assemble_golden_record(scraped_data)
         append_to_dataset(final_record)
         
         pretest_count = len(final_record['pretests'])
-        update_problem_on_success(problem_id, pretest_count)
-        
-        logging.info(f"Worker {worker_id}: SUCCESS for problem {problem_id}")
-        return True
-
+        update_problem_status_to_pending_arl(problem_id, pretest_count)
+        logging.info(f"INGESTION Worker {worker_id}: SUCCESS for {problem_id}")
     except Exception as e:
-        logging.error(f"Worker {worker_id}: FAILED for problem {problem_id}: {e}", exc_info=False)
-        update_problem_on_failure(problem_id, str(e))
-        return False
-    
+        logging.error(f"INGESTION Worker {worker_id}: FAILED for {problem_id}: {e}", exc_info=False)
+        update_problem_status_to_failed(problem_id, 'ingestion', str(e))
     finally:
-        if driver:
-            driver.quit()
+        if driver: driver.quit()
         update_worker_status(worker_id, None, None, 'idle')
 
+def arl_worker(problem: dict, worker_id: int):
+    """Worker for Stage 2: Processes data with LLMs. (Placeholder)"""
+    problem_id = problem['id']
+    try:
+        update_worker_status(worker_id, problem_id, 'ARL_ANALYST', 'active')
+        logging.info(f"ARL Worker {worker_id}: Processing {problem_id}...")
+        time.sleep(10) # Simulate LLM API call
+        logging.warning(f"ARL Worker {worker_id}: Placeholder complete for {problem_id}. Moving to 'failed_arl' for now.")
+        update_problem_status_to_failed(problem_id, 'arl', 'ARL stage not yet implemented.')
+    except Exception as e:
+        logging.error(f"ARL Worker {worker_id}: FAILED for {problem_id}: {e}", exc_info=False)
+        update_problem_status_to_failed(problem_id, 'arl', str(e))
+    finally:
+        update_worker_status(worker_id, None, None, 'idle')
+
+def vjs_worker(problem: dict, worker_id: int):
+    """Worker for Stage 3: Verifies code in Docker. (Placeholder)"""
+    problem_id = problem['id']
+    try:
+        update_worker_status(worker_id, problem_id, 'VJS_VERIFYING', 'active')
+        logging.info(f"VJS Worker {worker_id}: Verifying {problem_id}...")
+        time.sleep(5) # Simulate Docker verification
+        logging.warning(f"VJS Worker {worker_id}: Placeholder complete for {problem_id}. Moving to 'failed_vjs' for now.")
+        update_problem_status_to_failed(problem_id, 'vjs', 'VJS stage not yet implemented.')
+    except Exception as e:
+        logging.error(f"VJS Worker {worker_id}: FAILED for {problem_id}: {e}", exc_info=False)
+        update_problem_status_to_failed(problem_id, 'vjs', str(e))
+    finally:
+        update_worker_status(worker_id, None, None, 'idle')
+
+# --- The Main Orchestrator ---
 
 def main(args):
-    """Orchestrates the multi-threaded processing of problems."""
+    """The Factory Manager: Manages worker pools for each pipeline stage."""
     reset_all_workers_to_idle()
-
-    if args.ids:
-        problems_to_process = get_problems_by_ids(args.ids)
-    else:
-        problems_to_process = get_next_pending_problems(args.limit, args.min_rating, args.max_rating)
-
-    if not problems_to_process:
-        logging.info("No problems to process. Exiting.")
-        return
-
-    successful_count, failed_count = 0, 0
     
-    with ThreadPoolExecutor(max_workers=WORKER_COUNT) as executor:
-        futures = {
-            executor.submit(process_single_problem, problem, (i % WORKER_COUNT) + 1): problem
-            for i, problem in enumerate(problems_to_process)
-        }
-        for future in as_completed(futures):
-            problem = futures[future]
-            try:
-                success = future.result()
-                if success: successful_count += 1
-                else: failed_count += 1
-            except Exception as e:
-                logging.error(f"An unexpected error occurred for problem {problem['id']}: {e}")
-                failed_count += 1
-    
-    logging.info(f"\n--- Batch Complete ---")
-    logging.info(f"  Successfully processed: {successful_count}")
-    logging.info(f"  Failed to process:     {failed_count}")
-    logging.info(f"----------------------\n")
+    with ThreadPoolExecutor(max_workers=INGESTION_WORKER_COUNT, thread_name_prefix='INGEST') as ingest_pool, \
+         ThreadPoolExecutor(max_workers=ARL_WORKER_COUNT, thread_name_prefix='ARL') as arl_pool, \
+         ThreadPoolExecutor(max_workers=VJS_WORKER_COUNT, thread_name_prefix='VJS') as vjs_pool:
 
+        stop_event = threading.Event()
+        def shutdown():
+            logging.info("Shutdown signal received. Finishing active jobs...")
+            stop_event.set()
+
+        try:
+            while not stop_event.is_set():
+                ingestion_jobs = get_next_jobs('pending_ingestion', INGESTION_WORKER_COUNT, args.min_rating, args.max_rating)
+                arl_jobs = get_next_jobs('pending_arl', ARL_WORKER_COUNT)
+                vjs_jobs = get_next_jobs('pending_vjs', VJS_WORKER_COUNT)
+
+                if not any([ingestion_jobs, arl_jobs, vjs_jobs]):
+                    logging.info("No pending jobs in any stage. All work is done. Shutting down.")
+                    break
+
+                for i, job in enumerate(ingestion_jobs):
+                    ingest_pool.submit(ingestion_worker, job, i + 1)
+                for i, job in enumerate(arl_jobs):
+                    arl_pool.submit(arl_worker, job, i + 1 + INGESTION_WORKER_COUNT)
+                for i, job in enumerate(vjs_jobs):
+                    vjs_pool.submit(vjs_worker, job, i + 1 + INGESTION_WORKER_COUNT + ARL_WORKER_COUNT)
+
+                if args.run_once:
+                    logging.info("--run-once flag detected. Shutting down after this batch.")
+                    break
+                
+                logging.info("Cycle complete. Waiting for 15 seconds before checking for new jobs...")
+                time.sleep(15)
+
+        except KeyboardInterrupt:
+            shutdown()
+
+    logging.info("All worker pools have shut down. Project Synapse signing off.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the Project Synapse pipeline.", formatter_class=argparse.RawTextHelpFormatter)
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--ids", nargs='+', help="Manual mode: A specific list of problem IDs to process (e.g., 1A 7C).")
-    group.add_argument("--limit", type=int, help="Automated mode: Number of pending problems to process from the DB.")
-    parser.add_argument("--min_rating", type=int, help="[Auto Mode] Minimum rating of problems to fetch.")
-    parser.add_argument("--max_rating", type=int, help="[Auto Mode] Maximum rating of problems to fetch.")
+    parser = argparse.ArgumentParser(description="Run the Project Synapse stage-centric pipeline.")
+    parser.add_argument("--min_rating", type=int, help="Minimum rating of problems to ingest.")
+    parser.add_argument("--max_rating", type=int, help="Maximum rating of problems to ingest.")
+    parser.add_argument("--run-once", action='store_true', help="Run one cycle of job fetching and then exit.")
     args = parser.parse_args()
     main(args)
