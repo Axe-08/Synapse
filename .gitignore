@@ -14,4 +14,4 @@ __pycache__/
 *.DS_Store
 
 cookies.json
-cf_user_data/
+chrome_profile/
