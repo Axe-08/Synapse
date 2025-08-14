@@ -1,26 +1,136 @@
-# create_database.py
+# create_database.py (Live Monitoring Version)
 import sqlite3
+import requests
+import logging
+import time
+import os
+from datetime import datetime
 
+# --- Configuration ---
 DB_NAME = 'progress.db'
+API_URL = "https://codeforces.com/api/problemset.problems"
+# This defines how many problems our pipeline can process concurrently.
+# A good starting point is the number of CPU cores you have.
+WORKER_COUNT = 2 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-print(f"Setting up database '{DB_NAME}'...")
-
-# Connect to the database (this will create the file if it doesn't exist)
-conn = sqlite3.connect(DB_NAME)
-cursor = conn.cursor()
-
-# Create the main table to track our progress
-# status can be: 'pending', 'in_progress', 'completed', 'failed'
-cursor.execute('''
+# --- Main Problems Table Schema ---
+CREATE_PROBLEMS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS problems (
     id TEXT PRIMARY KEY,
-    status TEXT NOT NULL,
+    contest_id INTEGER NOT NULL,
+    problem_index TEXT NOT NULL,
+    name TEXT NOT NULL,
+    rating INTEGER,
+    tags TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    pretest_count INTEGER DEFAULT 0,
+    retry_count INTEGER DEFAULT 0,
+    notes TEXT,
     last_updated TEXT NOT NULL
-)
-''')
+);
+"""
 
-# Save the changes and close the connection
-conn.commit()
-conn.close()
+# --- NEW: Live Workers Table Schema ---
+CREATE_WORKERS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS live_workers (
+    worker_id INTEGER PRIMARY KEY,
+    problem_id TEXT,
+    stage TEXT,
+    status TEXT NOT NULL DEFAULT 'idle',
+    last_heartbeat TEXT NOT NULL
+);
+"""
 
-print("Database setup complete.")
+def populate_problems_table(cursor):
+    """Fetches all problems from the Codeforces API and inserts them."""
+    logging.info(f"Fetching problem list from Codeforces API...")
+    try:
+        response = requests.get(API_URL, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.RequestException as e:
+        logging.critical(f"Failed to fetch data from Codeforces API: {e}")
+        return False
+
+    if data.get('status') != 'OK':
+        logging.critical(f"API returned non-OK status: {data.get('comment')}")
+        return False
+
+    problems = data['result']['problems']
+    logging.info(f"Found {len(problems)} total problems. Inserting rated problems...")
+    
+    problems_to_insert = []
+    for p in problems:
+        if 'rating' not in p: continue
+        problem_id = f"{p['contestId']}{p['index']}"
+        tags = ", ".join(p.get('tags', []))
+        timestamp = datetime.now().isoformat()
+        problems_to_insert.append(
+            (problem_id, p['contestId'], p['index'], p['name'], p['rating'], tags, timestamp)
+        )
+
+    try:
+        cursor.executemany("INSERT INTO problems (id, contest_id, problem_index, name, rating, tags, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?)", problems_to_insert)
+        logging.info(f"Successfully inserted {cursor.rowcount} new problems.")
+        return True
+    except sqlite3.Error as e:
+        logging.error(f"Failed to bulk insert problems: {e}")
+        return False
+
+def initialize_workers_table(cursor, worker_count):
+    """Sets up the initial rows for the workers."""
+    logging.info(f"Initializing {worker_count} worker slots in the 'live_workers' table...")
+    timestamp = datetime.now().isoformat()
+    workers = [(i, 'idle', timestamp) for i in range(1, worker_count + 1)]
+    try:
+        cursor.executemany("INSERT OR REPLACE INTO live_workers (worker_id, status, last_heartbeat) VALUES (?, ?, ?)", workers)
+        logging.info("Worker slots initialized successfully.")
+    except sqlite3.Error as e:
+        logging.error(f"Failed to initialize worker slots: {e}")
+
+
+def main():
+    """Main function to set up and populate the database."""
+    if os.path.exists(DB_NAME):
+        logging.warning(f"Database '{DB_NAME}' already exists.")
+        response = input("This script will DELETE and re-create the database. Continue? (y/n): ").lower()
+        if response != 'y':
+            logging.info("Operation cancelled.")
+            return
+        try:
+            os.remove(DB_NAME)
+            logging.info(f"Removed existing database.")
+        except OSError as e:
+            logging.critical(f"Error removing existing database: {e}")
+            return
+            
+    logging.info(f"Setting up new database '{DB_NAME}'...")
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        logging.info("Creating 'problems' table...")
+        cursor.execute(CREATE_PROBLEMS_TABLE_SQL)
+        
+        logging.info("Creating 'live_workers' table...")
+        cursor.execute(CREATE_WORKERS_TABLE_SQL)
+        
+        if populate_problems_table(cursor):
+            initialize_workers_table(cursor, WORKER_COUNT)
+            conn.commit()
+            logging.info("Database setup and population complete.")
+        else:
+            logging.error("Database population failed. Rolling back changes.")
+            conn.rollback()
+    
+    except sqlite3.Error as e:
+        logging.critical(f"A database error occurred: {e}")
+    
+    finally:
+        if conn:
+            conn.close()
+
+if __name__ == "__main__":
+    main()
