@@ -1,4 +1,4 @@
-# synapse/database.py (The Dual-Database Librarian)
+# synapse/database.py (Definitive Phase 1 Version)
 import sqlite3
 from datetime import datetime
 import logging
@@ -8,124 +8,157 @@ from typing import List, Dict, Any, Optional
 PROGRESS_DB_PATH = 'progress.db'
 WORKSPACE_DB_PATH = 'workspace.db'
 
-def _get_progress_db_connection():
-    return sqlite3.connect(PROGRESS_DB_PATH, timeout=10)
+# --- Connection Management ---
+def _get_db_connection(db_path: str) -> sqlite3.Connection:
+    """Establishes a connection to a SQLite database, enabling WAL mode."""
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
 
-def _get_workspace_db_connection():
-    return sqlite3.connect(WORKSPACE_DB_PATH, timeout=10)
-
-# --- Live Worker Monitoring (operates on progress.db) ---
-def update_worker_status(worker_id: int, problem_id: Optional[str], stage: Optional[str], status: str):
+# --- Worker & Job Management (progress.db) ---
+def update_worker_status(worker_id: int, pool: str, problem_id: Optional[str], stage: Optional[str], status: str):
+    """Updates the live status of a single worker."""
     timestamp = datetime.now().isoformat()
-    with _get_progress_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE live_workers SET problem_id = ?, stage = ?, status = ?, last_heartbeat = ? WHERE worker_id = ?",
-            (problem_id, stage, status, timestamp, worker_id)
+    with _get_db_connection(PROGRESS_DB_PATH) as conn:
+        conn.execute(
+            "UPDATE live_workers SET problem_id = ?, stage = ?, status = ?, last_heartbeat = ? WHERE worker_id = ? AND pool = ?",
+            (problem_id, stage, status, timestamp, worker_id, pool)
         )
-        conn.commit()
 
 def reset_all_workers_to_idle():
+    """Resets all workers to idle at the start of a run."""
     logging.info("Resetting all worker statuses to 'idle'.")
     timestamp = datetime.now().isoformat()
-    with _get_progress_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE live_workers SET problem_id = NULL, stage = NULL, status = 'idle', last_heartbeat = ?", (timestamp,))
-        conn.commit()
+    with _get_db_connection(PROGRESS_DB_PATH) as conn:
+        conn.execute("UPDATE live_workers SET problem_id = NULL, stage = NULL, status = 'idle', last_heartbeat = ?", (timestamp,))
 
-# --- Pipeline Job Management (operates on progress.db) ---
-def get_next_jobs(status: str, limit: int, min_rating: Optional[int] = None, max_rating: Optional[int] = None) -> List[Dict[str, Any]]:
-    problems_to_process = []
+def get_next_jobs(status: str, limit: int) -> List[Dict[str, Any]]:
+    """
+    Atomically fetches and locks the next available jobs for a given stage.
+    Supports fetching single jobs (limit=1) or batches (limit > 1).
+    """
     new_status = f"in_progress_{status.split('_')[-1]}"
-    with _get_progress_db_connection() as conn:
+    with _get_db_connection(PROGRESS_DB_PATH) as conn:
         cursor = conn.cursor()
-        query = f"SELECT id, rating FROM problems WHERE status = ? "
-        params = [status]
-        if min_rating is not None: query += " AND rating >= ?"; params.append(min_rating)
-        if max_rating is not None: query += " AND rating <= ?"; params.append(max_rating)
-        query += " ORDER BY rating ASC, id ASC LIMIT ?"
-        params.append(limit)
-        cursor.execute(query, tuple(params))
+        cursor.execute(
+            "SELECT id, rating FROM problems WHERE status = ? ORDER BY rating ASC, id ASC LIMIT ?",
+            (status, limit)
+        )
         rows = cursor.fetchall()
-        if not rows: return []
+        if not rows:
+            return []
+        
         problem_ids = [row[0] for row in rows]
-        problems_to_process = [{'id': row[0], 'rating': row[1]} for row in rows]
+        jobs_to_process = [{'id': row[0], 'rating': row[1]} for row in rows]
+        
         timestamp = datetime.now().isoformat()
-        update_query = f"UPDATE problems SET status = ?, last_updated = ? WHERE id IN ({','.join('?' for _ in problem_ids)})"
-        cursor.execute(update_query, (new_status, timestamp, *problem_ids))
-        conn.commit()
-    logging.info(f"Locked {len(problems_to_process)} problems for stage '{status}'.")
-    return problems_to_process
+        placeholders = ','.join('?' for _ in problem_ids)
+        update_query = f"UPDATE problems SET status = ?, last_updated = ? WHERE id IN ({placeholders})"
+        
+        conn.execute(update_query, (new_status, timestamp, *problem_ids))
+    
+    logging.info(f"Locked {len(jobs_to_process)} problems for stage '{status}'.")
+    return jobs_to_process
 
-def update_problem_status_to_pending_arl(problem_id: str):
+# --- Problem State Transitions (progress.db) ---
+def _update_problem_status(problem_id: str, new_status: str, extra_updates: Optional[Dict[str, Any]] = None):
+    """Generic internal function to update a problem's status and other fields."""
     timestamp = datetime.now().isoformat()
-    with _get_progress_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE problems SET status = 'pending_arl', notes = NULL, last_updated = ? WHERE id = ?",
-            (timestamp, problem_id)
-        )
-        conn.commit()
+    with _get_db_connection(PROGRESS_DB_PATH) as conn:
+        base_query = "UPDATE problems SET status = ?, last_updated = ?"
+        params = [new_status, timestamp]
+        
+        if extra_updates:
+            # Note: This is a safe way to build dynamic queries for a known set of columns.
+            # It is not vulnerable to SQL injection as the column names are not from user input.
+            for col, val in extra_updates.items():
+                if col in ['analysis_try_count', 'implementation_try_count']:
+                    # Special handling for incremental updates
+                    base_query += f", {col} = {col} + ?"
+                else:
+                    base_query += f", {col} = ?"
+                params.append(val)
+        
+        base_query += " WHERE id = ?"
+        params.append(problem_id)
+        
+        conn.execute(base_query, tuple(params))
 
-def update_problem_status_to_failed(problem_id: str, stage: str, notes: str):
-    new_status = f"failed_{stage}"
+def transition_to_pending_analysis(problem_id: str):
+    _update_problem_status(problem_id, 'pending_analysis')
+    save_process_history(problem_id, 'INGESTION', 'SUCCESS', 'Data ingested. Ready for analysis.')
+
+def transition_batch_to_pending_implementation(problem_ids: List[str]):
+    for pid in problem_ids:
+        _update_problem_status(pid, 'pending_implementation', {'analysis_try_count': 1})
+        save_process_history(pid, 'ANALYSIS', 'SUCCESS', 'Pseudocode generated. Ready for implementation.')
+
+def transition_to_pending_vjs(problem_id: str):
+    _update_problem_status(problem_id, 'pending_vjs', {'implementation_try_count': 1})
+    save_process_history(problem_id, 'IMPLEMENTATION', 'SUCCESS', 'Code generated. Ready for VJS.')
+    
+def transition_to_pending_implementation_retry(problem_id: str, report: str):
+    _update_problem_status(problem_id, 'pending_implementation', {'last_vjs_report': report})
+    save_process_history(problem_id, 'VJS', 'RETRY_LOOP', f'Syntax/Compile error. Retrying implementation. Report: {report}')
+
+def transition_to_pending_analysis_retry(problem_id: str, report: str):
+    _update_problem_status(problem_id, 'pending_analysis', {'last_vjs_report': report, 'implementation_try_count': 0})
+    save_process_history(problem_id, 'VJS', 'RETRY_LOOP', f'Logic/Test error. Retrying analysis. Report: {report}')
+
+def transition_to_pending_data_assembly(problem_id: str):
+    _update_problem_status(problem_id, 'pending_data_assembly')
+    save_process_history(problem_id, 'VJS', 'SUCCESS', 'All tests passed. Ready for final assembly.')
+
+def transition_to_completed(problem_id: str):
+    _update_problem_status(problem_id, 'completed')
+    save_process_history(problem_id, 'DATA_ASSEMBLY', 'SUCCESS', 'Golden record created and saved.')
+
+def transition_to_failed(problem_id: str, stage: str, notes: str):
+    new_status = f"failed_{stage.lower()}"
+    _update_problem_status(problem_id, new_status, {'notes': notes})
+    save_process_history(problem_id, stage.upper(), 'FAILURE', f'Failed with error: {notes}')
+
+# --- Process History Logging (progress.db) ---
+def save_process_history(problem_id: str, stage: str, event_type: str, details: str):
+    """Logs a significant event in a problem's lifecycle."""
     timestamp = datetime.now().isoformat()
-    with _get_progress_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE problems SET status = ?, retry_count = retry_count + 1, notes = ?, last_updated = ? WHERE id = ?",
-            (new_status, notes, timestamp, problem_id)
+    with _get_db_connection(PROGRESS_DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO process_history (timestamp, problem_id, stage, event_type, details) VALUES (?, ?, ?, ?, ?)",
+            (timestamp, problem_id, stage, event_type, details)
         )
-        conn.commit()
 
-# --- NEW: Workspace Data Management (operates on workspace.db) ---
-def save_data_to_workspace(problem_id: str, html: str, ref_solution: dict, pretests: list):
-    """Saves the large data blobs for a problem to the workspace cache."""
-    ref_solution_json = json.dumps(ref_solution)
-    pretests_json = json.dumps(pretests)
-    with _get_workspace_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO problem_data_cache (problem_id, problem_statement_html, reference_solution_json, pretests_json) VALUES (?, ?, ?, ?)",
-            (problem_id, html, ref_solution_json, pretests_json)
+# --- Workspace Data Management (workspace.db) ---
+def save_ingestion_data_to_workspace(problem_id: str, html: str, ref_solution_obj: dict, ref_solution_code: str, pretests: list):
+    """Saves the initial data blobs from ingestion."""
+    with _get_db_connection(WORKSPACE_DB_PATH) as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO problem_data_cache 
+               (problem_id, problem_statement_html, reference_solution_json, reference_solution_code, pretests_json) 
+               VALUES (?, ?, ?, ?, ?)""",
+            (problem_id, html, json.dumps(ref_solution_obj), ref_solution_code, json.dumps(pretests))
         )
-        conn.commit()
 
-def get_data_from_workspace(problem_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieves all data for a problem from the workspace for ARL/VJS processing."""
-    with _get_workspace_db_connection() as conn:
+def get_batch_data_from_workspace(problem_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Retrieves all data for a batch of problems from the workspace."""
+    with _get_db_connection(WORKSPACE_DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM problem_data_cache WHERE problem_id = ?", (problem_id,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        placeholders = ','.join('?' for _ in problem_ids)
+        cursor = conn.execute(f"SELECT * FROM problem_data_cache WHERE problem_id IN ({placeholders})", problem_ids)
+        rows = cursor.fetchall()
+        return {row['problem_id']: dict(row) for row in rows} if rows else {}
+
+def update_workspace_with_analysis_results(problem_id: str, pseudocode: str):
+    """Updates a workspace record with the generated pseudocode."""
+    with _get_db_connection(WORKSPACE_DB_PATH) as conn:
+        conn.execute("UPDATE problem_data_cache SET arl_pseudocode = ? WHERE problem_id = ?", (pseudocode, problem_id))
+
+def update_workspace_with_implementation_results(problem_id: str, code: str):
+    """Updates a workspace record with the generated C++ code."""
+    with _get_db_connection(WORKSPACE_DB_PATH) as conn:
+        conn.execute("UPDATE problem_data_cache SET arl_reconstructed_code = ? WHERE problem_id = ?", (code, problem_id))
 
 def delete_data_from_workspace(problem_id: str):
     """Purges a problem's temporary data after it has been successfully finalized."""
-    with _get_workspace_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM problem_data_cache WHERE problem_id = ?", (problem_id,))
-        conn.commit()
-
-def update_key_statuses(service: str, managed_keys: List['ManagedKey']):
-    """Updates the status of all keys for a given service."""
-    timestamp = datetime.now().isoformat()
-    records = []
-    for key in managed_keys:
-        fingerprint = f"...{key.key_string[-4:]}"
-        records.append((
-            fingerprint,
-            service,
-            key.status.name,
-            key.cooldown_until
-        ))
-    
-    with _get_progress_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.executemany(
-            "INSERT OR REPLACE INTO key_status (key_fingerprint, service, status, cooldown_until) VALUES (?, ?, ?, ?)",
-            records
-        )
-        conn.commit()
-
-# We will implement update_workspace_with_arl_data later when we build the ARL worker.
+    with _get_db_connection(WORKSPACE_DB_PATH) as conn:
+        conn.execute("DELETE FROM problem_data_cache WHERE problem_id = ?", (problem_id,))
