@@ -90,16 +90,15 @@ def _assemble_golden_record(problem_id: str, workspace_data: dict) -> dict:
 # --- Specialized Worker Functions ---
 
 def ingestion_worker(problem: dict, worker_id: int, browser_queue: Queue):
-    """Worker for Stage 1: Uses a shared, persistent browser from a queue."""
     problem_id = problem['id']
     driver = None
-    fault = False
+    is_driver_owner = False
     try:
         update_worker_status(worker_id, problem_id, 'GET_BROWSER', 'active')
-        driver = browser_queue.get()
+        driver = browser_queue.get(timeout=10) # Wait for a browser
 
         if driver is None:
-            logging.info("No active browser found. Creating a new one...")
+            is_driver_owner = True # This worker is responsible for this browser's lifecycle
             update_worker_status(worker_id, problem_id, 'INITIALIZING', 'active')
             driver = get_authenticated_driver()
             if not driver: raise Exception("Failed to initialize browser.")
@@ -124,17 +123,19 @@ def ingestion_worker(problem: dict, worker_id: int, browser_queue: Queue):
         logging.info(f"SUCCESS for {problem_id}")
     except WebDriverException as e:
         logging.error(f"Browser fault detected for {problem_id}: {e}", exc_info=False)
-        fault = True
+        is_driver_owner = False # The driver is dead, don't return it
+        if driver: driver.quit()
         update_problem_status_to_failed(problem_id, 'ingestion', "WebDriverException")
     except Exception as e:
         logging.error(f"FAILED for {problem_id}: {e}", exc_info=False)
         update_problem_status_to_failed(problem_id, 'ingestion', str(e))
     finally:
-        if fault:
-            if driver: driver.quit()
-            browser_queue.put(None)
-        elif driver:
+        # KEY FIX: The worker ALWAYS puts a resource back.
+        # If it created a good browser, it returns it.
+        # If it encountered a fault or failed, it returns None, signaling the next worker to create a new one.
+        if is_driver_owner:
             browser_queue.put(driver)
+        # If this worker was just a "borrower", it doesn't do anything with the queue.
         update_worker_status(worker_id, None, None, 'idle')
 
 def arl_worker(problem: dict, worker_id: int, gemini_km: KeyManager, groq_km: KeyManager):
@@ -184,8 +185,9 @@ def main(args):
     """Manages worker pools for each pipeline stage."""
     reset_all_workers_to_idle()
     
-    browser_queue = Queue(maxsize=1)
-    browser_queue.put(None)
+    browser_queue = Queue(maxsize=INGESTION_WORKER_COUNT)
+    for _ in range(INGESTION_WORKER_COUNT):
+        browser_queue.put(None)
 
     gemini_key_manager = KeyManager(GEMINI_API_KEYS)
     groq_key_manager = KeyManager(GROQ_API_KEYS)
