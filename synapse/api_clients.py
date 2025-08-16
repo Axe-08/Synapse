@@ -13,12 +13,12 @@ import time
 import json
 from typing import List, Dict, Any
 
-import google.generativai as genai
+import google.generativeai as genai
 from groq import Groq, RateLimitError
 
 import synapse.database as db
 from synapse.key_manager import KeyManager, KeyStatus
-from google.generativai.types import HarmCategory, HarmBlockThreshold
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 # --- Model Configuration ---
 GEMINI_MODEL_NAME: str = 'gemini-2.5-pro' # Updated to latest stable model
