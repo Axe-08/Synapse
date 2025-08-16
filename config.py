@@ -26,6 +26,7 @@ DEFAULT_ANALYSIS_BATCH_SIZE = 5
 # --- Resilience & Retry Logic ---
 MAX_ANALYSIS_RETRIES = 3
 MAX_IMPLEMENTATION_RETRIES = 5
+MAX_RESCRAPING_ATTEMPTS = 2 # NEW: Max times to find a new reference solution
 
 # --- Scraper & Ingestion Timeouts (in seconds) ---
 DEFAULT_SCRAPER_REQUEST_TIMEOUT = 40

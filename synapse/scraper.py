@@ -172,6 +172,8 @@ def _get_best_submission(contest_id: str, problem_index: str) -> list | None:
             if not data or data.get('status') != 'OK' or not data.get('result'):
                 continue
             for sub in data['result']:
+                if sub.get('id') in exclude_ids:
+                    continue
                 if 'C++' in sub.get('programmingLanguage', '') and sub.get('problem', {}).get('index') == problem_index and sub.get('verdict') == 'OK':
                     all_candidates.append(sub)
     if not all_candidates:
@@ -182,7 +184,7 @@ def _get_best_submission(contest_id: str, problem_index: str) -> list | None:
     return all_candidates
 
 # --- This is now the master data aggregation function ---
-def fetch_problem_data(problem_id: str, driver: uc.Chrome) -> dict | None:
+def fetch_problem_data(problem_id: str, driver: uc.Chrome, exclude_submission_ids: Optional[List[str]] = Non) -> dict | None:
     """
     Fetches all problem data using a hybrid approach:
     1. Lightweight requests for public data.
@@ -202,9 +204,13 @@ def fetch_problem_data(problem_id: str, driver: uc.Chrome) -> dict | None:
 
     # Step 2: Find the best reference submission using the API
     logging.info(f"[{problem_id}] Step 2: Finding best reference submission via API.")
-    candidate_submissions = _get_best_submission(str(contest_id), problem_index)
+    candidate_submissions = _get_best_submission(
+        str(contest_id), 
+        problem_index, 
+        exclude_ids=exclude_submission_ids
+    )
     if not candidate_submissions:
-        return None
+        return None # No new submissions found
 
     # Step 3: Use the resource-heavy browser ONLY for authenticated scraping
     logging.info(f"[{problem_id}] Step 3: Using authenticated browser to fetch source code.")

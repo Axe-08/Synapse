@@ -160,6 +160,48 @@ def transition_to_failed(problem_id: str, stage: str, notes: str):
     _update_problem_status(problem_id, new_status, {'notes': notes})
     save_process_history(problem_id, stage.upper(), 'FAILURE', f'Failed with error: {notes[:1000]}')
 
+def transition_to_pending_rescraping(problem_id: str, failed_submission_id: str):
+    """
+    (Async) Transitions a problem to the re-scraping state after analysis retries are exhausted.
+    It increments the rescraping attempt counter and logs the failed submission ID.
+    """
+    # This logic needs to read the current state before writing, so it's a special case.
+    # We will perform the read synchronously and then enqueue the async write.
+    
+    current_tried_ids = ""
+    try:
+        with _get_db_connection(PROGRESS_DB_PATH) as conn:
+            cursor = conn.execute("SELECT tried_submission_ids FROM problems WHERE id = ?", (problem_id,))
+            result = cursor.fetchone()
+            if result and result[0]:
+                current_tried_ids = result[0]
+    except sqlite3.Error as e:
+        logging.error(f"Could not read tried_submission_ids for {problem_id}: {e}")
+
+    # Append the new failed ID
+    new_tried_ids = f"{current_tried_ids},{failed_submission_id}".strip(',')
+
+    extra_updates = {
+        'rescraping_attempts': 1, # Increments by 1
+        'tried_submission_ids': new_tried_ids
+    }
+    _update_problem_status(problem_id, 'pending_rescraping', extra_updates)
+    save_process_history(problem_id, 'ANALYSIS', 'FAILURE_LOOP', f'Analysis failed max retries. Attempting to find new reference solution. Failed submission: {failed_submission_id}.')
+
+def reset_retry_counts(problem_id: str):
+    """(Async) Resets the analysis and implementation retry counts for a problem after a successful re-scrape."""
+    extra_updates = {
+        'analysis_try_count': 0,
+        'implementation_try_count': 0,
+        'last_vjs_report': '' # Clear the old report
+    }
+    # We don't change the status here, just reset the counters.
+    # The worker will handle the final status transition.
+    timestamp = datetime.now().isoformat()
+    base_query = "UPDATE problems SET last_updated = ?, analysis_try_count = ?, implementation_try_count = ?, last_vjs_report = ? WHERE id = ?"
+    params = (timestamp, 0, 0, '', problem_id)
+    db_writer.execute(base_query, params)
+
 def transition_to_quarantined(problem_id: str, reason: str):
     new_status = "quarantined"
     _update_problem_status(problem_id, new_status, {'notes': reason})

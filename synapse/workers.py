@@ -15,16 +15,27 @@ from synapse.data_assembly import _assemble_golden_record, _parse_memory_limit, 
 from synapse.data_manager import append_to_dataset
 
 # Import config constants for retry logic
-from config import MAX_ANALYSIS_RETRIES, MAX_IMPLEMENTATION_RETRIES
+from config import MAX_ANALYSIS_RETRIES, MAX_IMPLEMENTATION_RETRIES, MAX_RESCRAPING_ATTEMPTS
 
 
-# --- STAGE 1, 2, 3 (Ingestion, Analysis, Implementation) ---
-# ... (These worker functions remain unchanged) ...
+# --- STAGE 1: INGESTION & RE-SCRAPING ---
 def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Queue):
     problem_id = problem['id']
     driver = None
     start_time = time.perf_counter()
+    
     try:
+        # --- Read current problem state for advanced logic ---
+        with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
+            cursor = conn.execute("SELECT status, tried_submission_ids FROM problems WHERE id = ?", (problem_id,))
+            result = cursor.fetchone()
+            if not result: raise Exception(f"Problem {problem_id} not found in database.")
+            current_status, tried_submission_ids_str = result
+        
+        is_rescraping = current_status == 'pending_rescraping'
+        exclude_ids = tried_submission_ids_str.split(',') if tried_submission_ids_str else []
+
+        # --- Scrape for new data ---
         db.update_worker_status(worker_id, 'INGESTION', problem_id, 'GET_BROWSER', 'active')
         driver = browser_queue.get(timeout=30)
         if driver is None:
@@ -33,9 +44,16 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Que
             if not driver: raise Exception("Failed to initialize a new browser session.")
         
         db.update_worker_status(worker_id, 'INGESTION', problem_id, 'SCRAPING', 'active')
-        scraped_data = fetch_problem_data(problem_id, driver)
-        if not scraped_data: raise Exception("Scraper returned no data.")
+        scraped_data = fetch_problem_data(problem_id, driver, exclude_submission_ids=exclude_ids)
+        
+        if not scraped_data:
+            # If scraping fails to find a *new* solution, quarantine the problem.
+            reason = "No new valid reference solutions found after re-scraping."
+            logging.warning(f"QUARANTINING {problem_id}: {reason}")
+            db.transition_to_quarantined(problem_id, reason)
+            raise Exception(reason)
 
+        # --- Save data and transition state ---
         db.update_worker_status(worker_id, 'INGESTION', problem_id, 'SAVING', 'active')
         db.save_ingestion_data_to_workspace(
             problem_id=problem_id,
@@ -46,15 +64,21 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Que
             time_limit_raw=scraped_data['page_details']['time_limit_raw'],
             memory_limit_raw=scraped_data['page_details']['memory_limit_raw']
         )
+        
+        if is_rescraping:
+            # If we were re-scraping, reset the retry counts for the new attempt.
+            db.reset_retry_counts(problem_id)
+        
         db.transition_to_pending_analysis(problem_id)
-        logging.info(f"SUCCESS [Ingestion] for {problem_id}. -> pending_analysis")
+        logging.info(f"SUCCESS [Ingestion/Re-scrape] for {problem_id}. -> pending_analysis")
 
         duration_ms = int((time.perf_counter() - start_time) * 1000)
-        db.log_metric('INGESTION', 'ingestion_task', duration_ms, True, {'problem_id': problem_id})
+        db.log_metric('INGESTION', 'ingestion_task', duration_ms, True, {'problem_id': problem_id, 'rescraped': is_rescraping})
 
     except Exception as e:
-        logging.error(f"FAILED [Ingestion] for {problem_id}: {e}", exc_info=False)
-        db.transition_to_failed(problem_id, 'ingestion', str(e))
+        if "No new valid reference solutions" not in str(e): # Avoid double-logging quarantine
+            logging.error(f"FAILED [Ingestion] for {problem_id}: {e}", exc_info=False)
+            db.transition_to_failed(problem_id, 'ingestion', str(e))
         
         duration_ms = int((time.perf_counter() - start_time) * 1000)
         db.log_metric('INGESTION', 'ingestion_task', duration_ms, False, {'problem_id': problem_id, 'error': str(e)})
@@ -62,34 +86,43 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Que
         if driver:
             try: driver.quit()
             except: pass
-        driver = None # Ensure a failed browser is discarded
+        driver = None
     finally:
         browser_queue.put(driver)
         db.update_worker_status(worker_id, 'INGESTION', None, None, 'idle')
 
+# --- STAGE 2: ANALYSIS (BATCHED) ---
 def analysis_worker(batch: List[Dict[str, Any]], worker_id: int, gemini_km: KeyManager):
     batch_ids = [p['id'] for p in batch]
     logging.info(f"Starting analysis for batch of {len(batch_ids)}: {batch_ids}")
     start_time = time.perf_counter()
     try:
-        # --- Quarantine Check ---
         valid_batch_for_api = []
         batch_ids_to_query = [p['id'] for p in batch]
         
-        # Use a direct connection for this read to ensure we have the latest data
         with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
             placeholders = ','.join('?' for _ in batch_ids_to_query)
-            cursor = conn.execute(f"SELECT id, analysis_try_count FROM problems WHERE id IN ({placeholders})", batch_ids_to_query)
-            problem_try_counts = {row[0]: row[1] for row in cursor.fetchall()}
+            cursor = conn.execute(f"SELECT id, analysis_try_count, rescraping_attempts FROM problems WHERE id IN ({placeholders})", batch_ids_to_query)
+            problem_states = {row[0]: {'analysis_tries': row[1], 'rescrapes': row[2]} for row in cursor.fetchall()}
 
         workspace_data = db.get_batch_data_from_workspace(batch_ids_to_query)
 
         for problem in batch:
             p_id = problem['id']
-            if problem_try_counts.get(p_id, 0) >= MAX_ANALYSIS_RETRIES:
-                reason = f"Exceeded max analysis retries ({MAX_ANALYSIS_RETRIES})."
-                logging.warning(f"QUARANTINING {p_id}: {reason}")
-                db.transition_to_quarantined(p_id, reason)
+            state = problem_states.get(p_id)
+            if not state: continue
+
+            if state['analysis_tries'] >= MAX_ANALYSIS_RETRIES:
+                # --- ENHANCEMENT: Trigger re-scraping instead of quarantining ---
+                if state['rescrapes'] >= MAX_RESCRAPING_ATTEMPTS:
+                    reason = f"Exceeded max analysis retries and max re-scraping attempts ({MAX_RESCRAPING_ATTEMPTS})."
+                    logging.warning(f"QUARANTINING {p_id}: {reason}")
+                    db.transition_to_quarantined(p_id, reason)
+                else:
+                    # Get the submission ID that just failed from the workspace
+                    failed_submission_id = json.loads(workspace_data[p_id].get('reference_solution_json', '{}')).get('id', 'unknown')
+                    logging.warning(f"Max analysis retries for {p_id}. Triggering re-scrape.")
+                    db.transition_to_pending_rescraping(p_id, str(failed_submission_id))
             elif p_id in workspace_data:
                 p_data = workspace_data[p_id]
                 valid_batch_for_api.append({
@@ -100,7 +133,7 @@ def analysis_worker(batch: List[Dict[str, Any]], worker_id: int, gemini_km: KeyM
                 })
 
         if not valid_batch_for_api:
-            logging.info("Batch is empty after quarantine/data check.")
+            logging.info("Batch is empty after quarantine/re-scrape check.")
             return
 
         db.update_worker_status(worker_id, 'ANALYSIS', ','.join(p['problem_id'] for p in valid_batch_for_api), 'API_CALL', 'active')

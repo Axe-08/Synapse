@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS problems (
     retry_count INTEGER DEFAULT 0,
     analysis_try_count INTEGER DEFAULT 0,
     implementation_try_count INTEGER DEFAULT 0,
+    rescraping_attempts INTEGER DEFAULT 0, 
+    tried_submission_ids TEXT,             
     last_vjs_report TEXT,
     notes TEXT,
     last_updated TEXT NOT NULL
