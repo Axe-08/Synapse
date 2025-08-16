@@ -25,3 +25,4 @@ debug_login_failure.png
 /data/
 /progress.db
 *.db
+*.db*

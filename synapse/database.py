@@ -118,6 +118,12 @@ def transition_to_failed(problem_id: str, stage: str, notes: str):
     _update_problem_status(problem_id, new_status, {'notes': notes})
     save_process_history(problem_id, stage.upper(), 'FAILURE', f'Failed with error: {notes}')
 
+def transition_to_quarantined(problem_id: str, reason: str):
+    """Moves a problem to a quarantined state after too many retries."""
+    new_status = "quarantined"
+    _update_problem_status(problem_id, new_status, {'notes': reason})
+    save_process_history(problem_id, 'SYSTEM', 'QUARANTINED', f'Quarantined due to: {reason}')
+
 # --- Process History Logging (progress.db) ---
 def save_process_history(problem_id: str, stage: str, event_type: str, details: str):
     """Logs a significant event in a problem's lifecycle."""
@@ -129,14 +135,14 @@ def save_process_history(problem_id: str, stage: str, event_type: str, details: 
         )
 
 # --- Workspace Data Management (workspace.db) ---
-def save_ingestion_data_to_workspace(problem_id: str, html: str, ref_solution_obj: dict, ref_solution_code: str, pretests: list):
+def save_ingestion_data_to_workspace(problem_id: str, html: str, ref_solution_obj: dict, ref_solution_code: str, pretests: list, time_limit_raw: str, memory_limit_raw: str):
     """Saves the initial data blobs from ingestion."""
     with _get_db_connection(WORKSPACE_DB_PATH) as conn:
         conn.execute(
             """INSERT OR REPLACE INTO problem_data_cache 
-               (problem_id, problem_statement_html, reference_solution_json, reference_solution_code, pretests_json) 
-               VALUES (?, ?, ?, ?, ?)""",
-            (problem_id, html, json.dumps(ref_solution_obj), ref_solution_code, json.dumps(pretests))
+               (problem_id, problem_statement_html, reference_solution_json, reference_solution_code, pretests_json, time_limit_raw, memory_limit_raw) 
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (problem_id, html, json.dumps(ref_solution_obj), ref_solution_code, json.dumps(pretests), time_limit_raw, memory_limit_raw)
         )
 
 def get_batch_data_from_workspace(problem_ids: List[str]) -> Dict[str, Dict[str, Any]]:

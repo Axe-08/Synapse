@@ -45,7 +45,7 @@ def fetch_problem_page_details(contest_id: int, problem_index: str) -> dict:
     url = PROBLEM_URL_TEMPLATE.format(contestId=contest_id, index=problem_index)
     logging.info(f"Scraping problem page: {url}")
     try:
-        response = requests.get(url, headers={'User-Agent': MY_USER_AGENT}, timeout=20)
+        response = requests.get(url, headers={'User-Agent': MY_USER_AGENT}, timeout=40)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
 
@@ -136,7 +136,7 @@ def _get_source_from_page(driver: uc.Chrome, url: str) -> str | None:
     try:
         logging.info(f"Navigating to submission URL: {url}")
         driver.get(url)
-        wait = WebDriverWait(driver, 30)
+        wait = WebDriverWait(driver, 10)
         code_element = wait.until(EC.presence_of_element_located((By.ID, "program-source-text")))
         final_text = code_element.text.strip()
         if not final_text or final_text == "N/A":
@@ -183,45 +183,52 @@ def _get_best_submission(contest_id: str, problem_index: str) -> list | None:
 
 # --- This is now the master data aggregation function ---
 def fetch_problem_data(problem_id: str, driver: uc.Chrome) -> dict | None:
-    # 1. Parse problem ID
+    """
+    Fetches all problem data using a hybrid approach:
+    1. Lightweight requests for public data.
+    2. Authenticated browser for protected data (solution code).
+    """
     match = re.match(r"(\d+)([A-Z]\d*)", problem_id)
     if not match:
         logging.error(f"Invalid problem_id format: {problem_id}")
         return None
     contest_id, problem_index = int(match.group(1)), match.group(2)
 
-    # 2. Scrape the public problem page (new step, no login needed)
+    # Step 1: Fast, public scrape with `requests`
+    logging.info(f"[{problem_id}] Step 1: Performing fast scrape for public data.")
     page_details = fetch_problem_page_details(contest_id, problem_index)
     if not page_details:
-        return None # Critical failure if we can't even get the problem page
+        return None # Critical failure if we can't get the problem page
 
-    # 3. Find the best reference submission using the parallel API search
+    # Step 2: Find the best reference submission using the API
+    logging.info(f"[{problem_id}] Step 2: Finding best reference submission via API.")
     candidate_submissions = _get_best_submission(str(contest_id), problem_index)
-    if not candidate_submissions: return None
+    if not candidate_submissions:
+        return None
 
-    # 4. Scrape the source code of the best candidate using the authenticated browser
+    # Step 3: Use the resource-heavy browser ONLY for authenticated scraping
+    logging.info(f"[{problem_id}] Step 3: Using authenticated browser to fetch source code.")
     solution_code, ref_submission = None, None
-    for candidate in candidate_submissions[:5]:
+    for candidate in candidate_submissions[:5]: # Try top 5 candidates
         submission_url = SUBMISSION_URL_TEMPLATE.format(contestId=candidate['contestId'], submissionId=candidate['id'])
-        logging.info(f"Attempting to scrape submission {candidate['id']} from '{candidate['author']['members'][0]['handle']}'.")
         source_code_text = _get_source_from_page(driver, submission_url)
         if source_code_text:
             solution_code = source_code_text
             ref_submission = candidate
-            logging.info(f"SUCCESS: Found valid source code in submission {candidate['id']}.")
+            logging.info(f"[{problem_id}] SUCCESS: Found valid source code in submission {candidate['id']}.")
             break
         else:
-            logging.warning(f"Failed to get valid source for submission {candidate['id']}. Trying next.")
+            logging.warning(f"[{problem_id}] Failed to get source for submission {candidate['id']}. Trying next.")
     
     if not solution_code or not ref_submission:
-        logging.critical(f"Could not find any valid submissions with source code.")
+        logging.critical(f"[{problem_id}] Could not find any submissions with accessible source code.")
         return None
 
-    # 5. Hybrid Pretest Strategy
+    # Step 4: Hybrid Pretest Strategy
     pretests = page_details['example_pretests']
     pretest_source = 'problem_page_examples'
     
-    # Re-auth requests session and try internal API
+    # Re-auth the requests session and try the internal API for more pretests
     browser_cookies = driver.get_cookies()
     for cookie in browser_cookies:
         session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
@@ -232,7 +239,7 @@ def fetch_problem_data(problem_id: str, driver: uc.Chrome) -> dict | None:
     if csrf_token:
         payload = {'submissionId': ref_submission['id'], 'csrf_token': csrf_token['content']}
         try:
-            logging.info("Attempting to enrich pretests via internal API...")
+            logging.info(f"[{problem_id}] Step 4: Attempting to enrich pretests via internal API...")
             response = session.post(f"{INTERNAL_API_BASE}/submitSource", data=payload, headers={'Referer': driver.current_url})
             response.raise_for_status()
             data = response.json()
@@ -245,16 +252,16 @@ def fetch_problem_data(problem_id: str, driver: uc.Chrome) -> dict | None:
             if len(api_pretests) > len(pretests):
                 pretests = api_pretests
                 pretest_source = 'internal_api'
-                logging.info(f"SUCCESS: Enriched pretests. Found {len(pretests)} total pretests.")
+                logging.info(f"[{problem_id}] SUCCESS: Enriched to {len(pretests)} total pretests.")
             else:
-                logging.info("Internal API did not provide additional pretests.")
+                logging.info(f"[{problem_id}] Internal API did not provide additional pretests.")
 
         except Exception as e:
-            logging.warning(f"Internal API call for pretests failed: {e}. Falling back to page examples.")
+            logging.warning(f"[{problem_id}] Internal API call for pretests failed: {e}. Falling back to page examples.")
     else:
-        logging.warning("Could not find CSRF token for internal API call.")
+        logging.warning(f"[{problem_id}] Could not find CSRF token for internal API call.")
 
-    # 6. Assemble and return all collected data
+    # Step 5: Assemble and return all collected data
     return {
         "problem_id": problem_id,
         "page_details": page_details,

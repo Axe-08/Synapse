@@ -1,160 +1,224 @@
-# synapse/workers.py
 import logging
-import time
 import json
-import os
 from queue import Queue
+from typing import Dict, Any, List
 
-# Imports needed for all workers
-from selenium.common.exceptions import WebDriverException
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
-from bs4 import BeautifulSoup
-
-# Imports from your project's modules
-from synapse.database import (
-    update_worker_status,
-    update_problem_status_to_pending_arl,
-    update_problem_status_to_pending_vjs,
-    update_problem_status_to_failed,
-    update_problem_status_to_done,
-    save_data_to_workspace,
-    get_data_from_workspace,
-    update_workspace_with_arl_data,
-    delete_data_from_workspace
-)
+# Project-specific imports
+import synapse.database as db
 from synapse.scraper import get_authenticated_driver, fetch_problem_data
-from synapse.api_clients import call_gemini_analyst, call_groq_implementer
-from synapse.vjs import run_vjs # Assuming this module exists
-from synapse.data_manager import append_to_dataset
+from synapse.api_clients import call_gemini_analyst_batch, call_groq_implementer
 from synapse.key_manager import KeyManager
+from synapse.vjs import run_vjs
+from synapse.data_assembly import _parse_time_limit, _parse_memory_limit
+# from synapse.data_assembly import _assemble_golden_record # For Phase 3
+# from synapse.data_manager import append_to_dataset # For Phase 3
 
-# Import the new data assembly helpers
-from synapse.data_assembly import _assemble_golden_record
+# Import retry constants from main, with a fallback for standalone testing
+try:
+    from main import MAX_ANALYSIS_RETRIES, MAX_IMPLEMENTATION_RETRIES
+except ImportError:
+    MAX_ANALYSIS_RETRIES = 3
+    MAX_IMPLEMENTATION_RETRIES = 5
 
-# --- Worker Functions ---
-# (The ingestion_worker and arl_worker are correct as you provided them)
-def ingestion_worker(problem: dict, worker_id: int, browser_queue: Queue):
+# --- STAGE 1: INGESTION ---
+def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Queue):
     problem_id = problem['id']
     driver = None
     try:
-        update_worker_status(worker_id, problem_id, 'GET_BROWSER', 'active')
-        driver = browser_queue.get(timeout=10) # Wait for a browser
-        if driver is None:
-            update_worker_status(worker_id, problem_id, 'INITIALIZING', 'active')
+        db.update_worker_status(worker_id, 'INGESTION', problem_id, 'GET_BROWSER', 'active')
+        driver = browser_queue.get(timeout=30)
+        if driver is None: # Sentinel value for a dead browser
+            db.update_worker_status(worker_id, 'INGESTION', problem_id, 'INITIALIZING', 'active')
             driver = get_authenticated_driver()
-            if not driver: raise Exception("Failed to initialize browser.")
+            if not driver: raise Exception("Failed to initialize a new browser session.")
         
-        # NOTE: Authenticated driver warm-up logic would go here,
-        # but for this file, we assume it's handled in main or get_authenticated_driver.
-        
+        db.update_worker_status(worker_id, 'INGESTION', problem_id, 'SCRAPING', 'active')
         scraped_data = fetch_problem_data(problem_id, driver)
         if not scraped_data: raise Exception("Scraper returned no data.")
 
-        update_worker_status(worker_id, problem_id, 'SAVING', 'active')
-        save_data_to_workspace(
+        db.update_worker_status(worker_id, 'INGESTION', problem_id, 'SAVING', 'active')
+        db.save_ingestion_data_to_workspace(
             problem_id=problem_id,
             html=scraped_data['page_details']['problem_statement_html'],
-            ref_solution=scraped_data['ref_submission'],
+            ref_solution_obj=scraped_data['ref_submission'],
+            ref_solution_code=scraped_data['solution_code'],
             pretests=scraped_data['pretests'],
-            ref_solution_code=scraped_data['solution_code']
+            time_limit_raw=scraped_data['page_details']['time_limit_raw'],
+            memory_limit_raw=scraped_data['page_details']['memory_limit_raw']
         )
-        update_problem_status_to_pending_arl(problem_id)
-        logging.info(f"SUCCESS: Ingestion for {problem_id} complete. -> pending_arl")
+        db.transition_to_pending_analysis(problem_id)
+        logging.info(f"SUCCESS [Ingestion] for {problem_id}. -> pending_analysis")
 
-    except WebDriverException as e:
-        logging.error(f"Browser fault detected for {problem_id}: {e}", exc_info=False)
-        if driver: driver.quit()
-        driver = None
-        update_problem_status_to_failed(problem_id, 'ingestion', "WebDriverException")
     except Exception as e:
-        logging.error(f"FAILED Ingestion for {problem_id}: {e}", exc_info=False)
-        update_problem_status_to_failed(problem_id, 'ingestion', str(e))
-    finally:
+        logging.error(f"FAILED [Ingestion] for {problem_id}: {e}", exc_info=False)
+        db.transition_to_failed(problem_id, 'ingestion', str(e))
         if driver:
-            browser_queue.put(driver)
-        else:
-            browser_queue.put(None)
-        update_worker_status(worker_id, None, None, 'idle')
+            try: driver.quit()
+            except: pass
+        driver = None
+    finally:
+        browser_queue.put(driver)
+        db.update_worker_status(worker_id, 'INGESTION', None, None, 'idle')
 
-# --- Your full ARL worker implementation (as you provided it) ---
-MAX_ARL_ATTEMPTS = 5
-def arl_worker(problem: dict, worker_id: int, gemini_km: KeyManager, groq_km: KeyManager):
-    problem_id = problem['id']
+# --- STAGE 2: ANALYSIS (BATCHED) ---
+def analysis_worker(batch: List[Dict[str, Any]], worker_id: int, gemini_km: KeyManager):
+    batch_ids = [p['id'] for p in batch]
+    logging.info(f"Starting analysis for batch of {len(batch_ids)}: {batch_ids}")
     try:
-        update_worker_status(worker_id, problem_id, 'ARL_FETCH', 'active')
-        workspace_data = get_data_from_workspace(problem_id)
-        if not workspace_data:
-            raise Exception("Problem data not found in workspace.")
-
-        ref_solution_code = json.loads(workspace_data['reference_solution_json'])['code']
-        problem_html = workspace_data['problem_statement_html']
+        # --- Quarantine Check ---
+        valid_batch_for_api = []
+        batch_ids_to_query = [p['id'] for p in batch]
         
-        for attempt in range(MAX_ARL_ATTEMPTS):
-            update_worker_status(worker_id, problem_id, f'ANALYST_ATTEMPT_{attempt+1}', 'active')
-            feedback = workspace_data.get('arl_feedback', '')
-            analyst_prompt_input = {
-                "problem_html": problem_html,
-                "solution_code": ref_solution_code,
-                "feedback": feedback
-            }
-            pseudocode = call_gemini_analyst(analyst_prompt_input, gemini_km)
-            
-            update_worker_status(worker_id, problem_id, f'IMPLEMENTER_ATTEMPT_{attempt+1}', 'active')
-            implementer_prompt_input = {
-                "problem_html": problem_html,
-                "pseudocode": pseudocode
-            }
-            reconstructed_code = call_groq_implementer(implementer_prompt_input, groq_km)
-            
-            update_worker_status(worker_id, problem_id, f'VJS_ATTEMPT_{attempt+1}', 'active')
-            vjs_result = run_vjs(
-                problem_id=problem_id,
-                reconstructed_code=reconstructed_code,
-                pretests=json.loads(workspace_data['pretests_json'])
-            )
+        with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
+            placeholders = ','.join('?' for _ in batch_ids_to_query)
+            cursor = conn.execute(f"SELECT id, analysis_try_count FROM problems WHERE id IN ({placeholders})", batch_ids_to_query)
+            problem_try_counts = {row[0]: row[1] for row in cursor.fetchall()}
 
-            if vjs_result['status'] == 'SUCCESS':
-                update_problem_status_to_pending_vjs(problem_id)
-                update_workspace_with_arl_data(problem_id, pseudocode, reconstructed_code)
-                logging.info(f"SUCCESS: ARL completed for {problem_id} in {attempt+1} attempts. -> pending_vjs")
-                return
-            else:
-                logging.warning(f"ARL failed for {problem_id} on attempt {attempt+1}. Reason: {vjs_result['report']}")
-                workspace_data['arl_feedback'] = vjs_result['report']
+        workspace_data = db.get_batch_data_from_workspace(batch_ids_to_query)
+
+        for problem in batch:
+            p_id = problem['id']
+            try_count = problem_try_counts.get(p_id, 0)
+            
+            if try_count >= MAX_ANALYSIS_RETRIES:
+                reason = f"Exceeded max analysis retries ({MAX_ANALYSIS_RETRIES})."
+                logging.warning(f"QUARANTINING {p_id}: {reason}")
+                db.transition_to_quarantined(p_id, reason)
+            elif p_id in workspace_data:
+                p_data = workspace_data[p_id]
+                valid_batch_for_api.append({
+                    "problem_id": p_id,
+                    "html_statement": p_data.get('problem_statement_html'),
+                    "reference_code": p_data.get('reference_solution_code'),
+                    "vjs_report": p_data.get('last_vjs_report')
+                })
+
+        if not valid_batch_for_api:
+            logging.info("Batch is empty after quarantine/data check.")
+            return
         
-        update_problem_status_to_failed(problem_id, 'arl', f"Failed after {MAX_ARL_ATTEMPTS} attempts. Last error: {workspace_data.get('arl_feedback', 'N/A')}")
-        logging.error(f"ARL failed permanently for {problem_id}.")
+        db.update_worker_status(worker_id, 'ANALYSIS', ','.join(p['problem_id'] for p in valid_batch_for_api), 'API_CALL', 'active')
+        pseudocode_results = call_gemini_analyst_batch(valid_batch_for_api, gemini_km)
+
+        db.update_worker_status(worker_id, 'ANALYSIS', ','.join(pseudocode_results.keys()), 'UPDATING_DB', 'active')
+        successful_ids = []
+        for problem_id, pseudocode in pseudocode_results.items():
+            db.update_workspace_with_analysis_results(problem_id, pseudocode)
+            successful_ids.append(problem_id)
+        
+        if successful_ids:
+            db.transition_batch_to_pending_implementation(successful_ids)
+        
+        logging.info(f"SUCCESS [Analysis] for {len(successful_ids)} problems. -> pending_implementation")
 
     except Exception as e:
-        logging.error(f"CRITICAL ARL FAILURE for {problem_id}: {e}", exc_info=True)
-        update_problem_status_to_failed(problem_id, 'arl', str(e))
+        logging.error(f"FAILED [Analysis] for batch {batch_ids}: {e}", exc_info=True)
+        for problem_id in batch_ids:
+            db.transition_to_failed(problem_id, 'analysis', str(e))
     finally:
-        update_worker_status(worker_id, None, None, 'idle')
+        db.update_worker_status(worker_id, 'ANALYSIS', None, None, 'idle')
 
-def vjs_worker(problem: dict, worker_id: int):
-    """Worker for Stage 3: Verification, Judgement, Storage."""
+# --- STAGE 3: IMPLEMENTATION ---
+def implementation_worker(problem: Dict[str, Any], worker_id: int, groq_km: KeyManager):
     problem_id = problem['id']
     try:
-        update_worker_status(worker_id, problem_id, 'FETCH_WORKSPACE', 'active')
-        workspace_data = get_data_from_workspace(problem_id)
-        if not workspace_data:
-            raise ValueError("Workspace data not found.")
+        # --- Quarantine Check ---
+        with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
+            cursor = conn.execute("SELECT implementation_try_count FROM problems WHERE id = ?", (problem_id,))
+            result = cursor.fetchone()
         
-        update_worker_status(worker_id, problem_id, 'ASSEMBLE_RECORD', 'active')
-        golden_record = _assemble_golden_record(problem_id, workspace_data)
+        try_count = result[0] if result else 0
+        if try_count >= MAX_IMPLEMENTATION_RETRIES:
+            reason = f"Exceeded max implementation retries ({MAX_IMPLEMENTATION_RETRIES})."
+            logging.warning(f"QUARANTINING {problem_id}: {reason}")
+            db.transition_to_quarantined(problem_id, reason)
+            return
+
+        db.update_worker_status(worker_id, 'IMPLEMENTATION', problem_id, 'FETCH_DATA', 'active')
+        workspace_data = db.get_batch_data_from_workspace([problem_id])
+        if not workspace_data: raise Exception("Workspace data not found.")
         
-        update_worker_status(worker_id, problem_id, 'SAVE_TO_DATASET', 'active')
-        append_to_dataset(golden_record)
+        p_data = workspace_data[problem_id]
         
-        # Clean up the workspace after successful processing
-        delete_data_from_workspace(problem_id)
-        
-        update_problem_status_to_done(problem_id)
-        logging.info(f"SUCCESS: VJS for {problem_id} complete. -> done")
+        pseudocode = p_data.get('arl_pseudocode')
+        if not pseudocode: raise Exception("Pseudocode not found in workspace data.")
+
+        db.update_worker_status(worker_id, 'IMPLEMENTATION', problem_id, 'API_CALL', 'active')
+        reconstructed_code = call_groq_implementer(
+            problem_html=p_data.get('problem_statement_html'),
+            pseudocode=pseudocode,
+            vjs_report=p_data.get('last_vjs_report'),
+            key_manager=groq_km
+        )
+
+        db.update_worker_status(worker_id, 'IMPLEMENTATION', problem_id, 'SAVING', 'active')
+        db.update_workspace_with_implementation_results(problem_id, reconstructed_code)
+        db.transition_to_pending_vjs(problem_id)
+        logging.info(f"SUCCESS [Implementation] for {problem_id}. -> pending_vjs")
+
     except Exception as e:
-        logging.error(f"FAILED VJS for {problem_id}: {e}", exc_info=True)
-        update_problem_status_to_failed(problem_id, 'vjs', str(e))
+        logging.error(f"FAILED [Implementation] for {problem_id}: {e}", exc_info=False)
+        db.transition_to_failed(problem_id, 'implementation', str(e))
     finally:
-        update_worker_status(worker_id, None, None, 'idle')
+        db.update_worker_status(worker_id, 'IMPLEMENTATION', None, None, 'idle')
+
+# --- STAGE 4: VJS (Verification & Judging Service) ---
+def vjs_worker(problem: Dict[str, Any], worker_id: int):
+    problem_id = problem['id']
+    try:
+        db.update_worker_status(worker_id, 'VJS', problem_id, 'FETCHING', 'active')
+        workspace_data = db.get_batch_data_from_workspace([problem_id]).get(problem_id)
+        if not workspace_data:
+            raise Exception("Workspace data not found for VJS.")
+
+        code = workspace_data.get('arl_reconstructed_code')
+        pretests = json.loads(workspace_data.get('pretests_json', '[]'))
+        time_limit_ms = _parse_time_limit(workspace_data.get('time_limit_raw', '1 second'))
+        memory_limit_kb = _parse_memory_limit(workspace_data.get('memory_limit_raw', '256 megabytes'))
+
+        if not all([code, pretests]):
+            raise Exception("Missing code or pretests in workspace.")
+
+        db.update_worker_status(worker_id, 'VJS', problem_id, 'JUDGING', 'active')
+        result = run_vjs(problem_id, code, pretests, time_limit_ms, memory_limit_kb)
+
+        logging.info(f"VJS result for {problem_id}: {result['status']}")
+
+        if result['status'] == 'SUCCESS':
+            db.transition_to_pending_data_assembly(problem_id)
+        elif result['status'] == 'COMPILE_ERROR':
+            db.transition_to_pending_implementation_retry(problem_id, result['report'])
+        elif result['status'] in ['TIME_LIMIT_EXCEEDED', 'MEMORY_LIMIT_EXCEEDED', 'WRONG_ANSWER', 'RUNTIME_ERROR']:
+            db.transition_to_pending_analysis_retry(problem_id, result['report'])
+        else: # VJS_ERROR
+            raise Exception(f"VJS system error: {result['report']}")
+
+    except Exception as e:
+        logging.error(f"FAILED [VJS] for {problem_id}: {e}", exc_info=True)
+        db.transition_to_failed(problem_id, 'vjs', str(e))
+    finally:
+        db.update_worker_status(worker_id, 'VJS', None, None, 'idle')
+
+# --- STAGE 5: DATA ASSEMBLY ---
+def data_assembly_worker(problem: Dict[str, Any], worker_id: int):
+    problem_id = problem['id']
+    logging.info(f"Data Assembly worker for {problem_id} started (STUB).")
+    try:
+        db.update_worker_status(worker_id, 'DATA_ASSEMBLY', problem_id, 'ASSEMBLING', 'active')
+        
+        # --- LOGIC TO BE IMPLEMENTED IN PHASE 3 ---
+        # from synapse.data_assembly import _assemble_golden_record
+        # from synapse.data_manager import append_to_dataset
+        # workspace_data = db.get_batch_data_from_workspace([problem_id])[problem_id]
+        # golden_record = _assemble_golden_record(problem_id, workspace_data)
+        # append_to_dataset(golden_record)
+        
+        db.delete_data_from_workspace(problem_id)
+        db.transition_to_completed(problem_id)
+        logging.info(f"SUCCESS [Data Assembly] for {problem_id}. -> completed")
+        
+    except Exception as e:
+        logging.error(f"FAILED [Data Assembly] for {problem_id}: {e}", exc_info=False)
+        db.transition_to_failed(problem_id, 'data_assembly', str(e))
+    finally:
+        db.update_worker_status(worker_id, 'DATA_ASSEMBLY', None, None, 'idle')

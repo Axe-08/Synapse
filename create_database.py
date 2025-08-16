@@ -84,7 +84,9 @@ CREATE TABLE IF NOT EXISTS problem_data_cache (
     arl_reconstructed_code TEXT,
     arl_feedback TEXT,
     vjs_last_report TEXT,
-    static_analysis_json TEXT
+    static_analysis_json TEXT,
+    time_limit_raw TEXT,
+    memory_limit_raw TEXT
 );
 """
 

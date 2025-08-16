@@ -35,6 +35,8 @@ from create_database import (
 
 # Static batch size for the analysis stage (can be made dynamic in Phase 4)
 ANALYSIS_BATCH_SIZE = 5
+MAX_ANALYSIS_RETRIES = 3    # Max times a problem can be sent back for re-analysis
+MAX_IMPLEMENTATION_RETRIES = 5 # Max times a problem can be sent back for re-implementation
 
 # --- Load Environment Variables ---
 load_dotenv()
