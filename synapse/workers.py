@@ -8,10 +8,10 @@ import synapse.database as db
 from synapse.scraper import get_authenticated_driver, fetch_problem_data
 from synapse.api_clients import call_gemini_analyst_batch, call_groq_implementer
 from synapse.key_manager import KeyManager
-from synapse.vjs import run_vjs
+from synapse.vjs import run_vjs.run_static_analysis
 from synapse.data_assembly import _parse_time_limit, _parse_memory_limit
-# from synapse.data_assembly import _assemble_golden_record # For Phase 3
-# from synapse.data_manager import append_to_dataset # For Phase 3
+from synapse.data_assembly import _assemble_golden_record ,_parse_memory_limit, _parse_time_limit
+from synapse.data_manager import append_to_dataset 
 
 # Import retry constants from main, with a fallback for standalone testing
 try:
@@ -185,6 +185,17 @@ def vjs_worker(problem: Dict[str, Any], worker_id: int):
         logging.info(f"VJS result for {problem_id}: {result['status']}")
 
         if result['status'] == 'SUCCESS':
+            db.update_worker_status(worker_id, 'VJS', problem_id, 'ANALYZING', 'active')
+            logging.info(f"VJS SUCCESS for {problem_id}. Running static analysis...")
+            
+            ref_code = workspace_data.get('reference_solution_code')
+            
+            analysis_results = {
+                'reference_analysis': run_static_analysis(ref_code) if ref_code else {},
+                'reconstructed_analysis': run_static_analysis(code)
+            }
+            analysis_json_string = json.dumps(analysis_results)
+            db.update_workspace_with_static_analysis(problem_id, analysis_json_string)  
             db.transition_to_pending_data_assembly(problem_id)
         elif result['status'] == 'COMPILE_ERROR':
             db.transition_to_pending_implementation_retry(problem_id, result['report'])
@@ -202,18 +213,24 @@ def vjs_worker(problem: Dict[str, Any], worker_id: int):
 # --- STAGE 5: DATA ASSEMBLY ---
 def data_assembly_worker(problem: Dict[str, Any], worker_id: int):
     problem_id = problem['id']
-    logging.info(f"Data Assembly worker for {problem_id} started (STUB).")
     try:
         db.update_worker_status(worker_id, 'DATA_ASSEMBLY', problem_id, 'ASSEMBLING', 'active')
         
-        # --- LOGIC TO BE IMPLEMENTED IN PHASE 3 ---
-        # from synapse.data_assembly import _assemble_golden_record
-        # from synapse.data_manager import append_to_dataset
-        # workspace_data = db.get_batch_data_from_workspace([problem_id])[problem_id]
-        # golden_record = _assemble_golden_record(problem_id, workspace_data)
-        # append_to_dataset(golden_record)
+        # 1. Retrieve all data from the workspace cache
+        workspace_data = db.get_batch_data_from_workspace([problem_id]).get(problem_id)
+        if not workspace_data:
+            raise Exception("Workspace data not found for final assembly.")
+
+        # 2. Assemble the final, complete "golden record"
+        golden_record = _assemble_golden_record(problem_id, workspace_data)
         
+        # 3. Append the record to the final dataset file
+        append_to_dataset(golden_record)
+        
+        # 4. Clean up the large, temporary data from the workspace
         db.delete_data_from_workspace(problem_id)
+
+        # 5. Mark the problem as completed
         db.transition_to_completed(problem_id)
         logging.info(f"SUCCESS [Data Assembly] for {problem_id}. -> completed")
         

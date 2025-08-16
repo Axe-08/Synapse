@@ -4,7 +4,9 @@ import os
 import shutil
 import logging
 from typing import List, Dict
-
+import subprocess
+import tempfile
+import xml.etree.ElementTree as ET
 # Initialize the Docker client from the environment
 try:
     client = docker.from_env()
@@ -84,3 +86,55 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
             shutil.rmtree(host_dir)
 
     return {'status': 'SUCCESS', 'report': f'All {len(pretests)} tests passed'}
+
+def run_static_analysis(code: str) -> dict:
+    """
+    Runs cppcheck on a given C++ code string and returns a structured summary.
+    """
+    # cppcheck writes its XML report to stderr, not stdout.
+    temp_filepath = None
+    try:
+        # Create a temporary file to store the code
+        with tempfile.NamedTemporaryFile(mode='w+', suffix='.cpp', delete=False) as temp_f:
+            temp_filepath = temp_f.name
+            temp_f.write(code)
+
+        # Execute the cppcheck command
+        cmd = ["cppcheck", f"--enable=all", "--xml", temp_filepath]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        xml_output = result.stderr
+
+        # Parse the XML output
+        summary = {'errors': [], 'error_counts': {}}
+        if not xml_output:
+            return summary
+
+        root = ET.fromstring(xml_output)
+        errors_node = root.find('errors')
+        if errors_node is None:
+            return summary
+
+        for error in errors_node:
+            summary['errors'].append({
+                'id': error.get('id'),
+                'severity': error.get('severity'),
+                'msg': error.get('msg'),
+                'verbose': error.get('verbose'),
+                'file': error.find('location').get('file') if error.find('location') is not None else None,
+                'line': int(error.find('location').get('line', 0)) if error.find('location') is not None else 0
+            })
+            severity = error.get('severity', 'unknown')
+            summary['error_counts'][severity] = summary['error_counts'].get(severity, 0) + 1
+        
+        return summary
+
+    except ET.ParseError as e:
+        logging.warning(f"Failed to parse cppcheck XML output: {e}")
+        return {'status': 'PARSE_ERROR', 'report': str(e)}
+    except Exception as e:
+        logging.error(f"An unexpected error occurred in run_static_analysis: {e}")
+        return {'status': 'ANALYSIS_ERROR', 'report': str(e)}
+    finally:
+        # Ensure the temporary file is always deleted
+        if temp_filepath and os.path.exists(temp_filepath):
+            os.remove(temp_filepath)

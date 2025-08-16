@@ -154,6 +154,11 @@ def get_batch_data_from_workspace(problem_ids: List[str]) -> Dict[str, Dict[str,
         rows = cursor.fetchall()
         return {row['problem_id']: dict(row) for row in rows} if rows else {}
 
+def update_workspace_with_static_analysis(problem_id: str, analysis_json: str):
+    """Updates a workspace record with the JSON result from static analysis."""
+    with _get_db_connection(WORKSPACE_DB_PATH) as conn:
+        conn.execute("UPDATE problem_data_cache SET static_analysis_json = ? WHERE problem_id = ?", (analysis_json, problem_id))
+
 def update_workspace_with_analysis_results(problem_id: str, pseudocode: str):
     """Updates a workspace record with the generated pseudocode."""
     with _get_db_connection(WORKSPACE_DB_PATH) as conn:

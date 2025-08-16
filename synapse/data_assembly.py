@@ -32,7 +32,8 @@ def _assemble_golden_record(problem_id: str, workspace_data: dict) -> dict:
     time_limit_raw = soup.find('div', class_='time-limit').text.replace('time limit per test', '').strip()
     memory_limit_raw = soup.find('div', class_='memory-limit').text.replace('memory limit per test', '').strip()
 
-    return {
+    # --- NEW: Add static analysis results ---
+    final_record = {
         "problem_id": problem_id,
         "problem_url": PROBLEM_URL_TEMPLATE.format(contestId=ref['problem']['contestId'], index=ref['problem']['index']),
         "problem_metadata": {
@@ -52,3 +53,14 @@ def _assemble_golden_record(problem_id: str, workspace_data: dict) -> dict:
         "verified_pseudocode": workspace_data.get('arl_pseudocode'),
         "verified_solution_code": workspace_data.get('arl_reconstructed_code')
     }
+    
+    analysis_json = workspace_data.get('static_analysis_json')
+    if analysis_json:
+        try:
+            final_record['code_quality_analysis'] = json.loads(analysis_json)
+        except json.JSONDecodeError:
+            logging.warning(f"Could not parse static_analysis_json for {problem_id}")
+            final_record['code_quality_analysis'] = None
+    # --- End of New Step ---
+
+    return final_record
