@@ -5,18 +5,23 @@ import logging
 import time
 import os
 from datetime import datetime
-
-# --- Configuration ---
-PROGRESS_DB_NAME = 'progress.db'
-WORKSPACE_DB_NAME = 'workspace.db'
-API_URL = "https://codeforces.com/api/problemset.problems"
-
+from config import (
+    DEFAULT_INGESTION_WORKER_COUNT,
+    DEFAULT_ANALYSIS_WORKER_COUNT,
+    DEFAULT_IMPLEMENTATION_WORKER_COUNT,
+    DEFAULT_VJS_WORKER_COUNT,
+    DEFAULT_DATA_ASSEMBLY_WORKER_COUNT,
+    DEFAULT_ANALYSIS_BATCH_SIZE,
+    PROGRESS_DB_NAME,
+    WORKSPACE_DB_NAME,
+    API_URL
+)
 # Worker pool configuration remains the single source of truth for concurrency
-INGESTION_WORKER_COUNT = 1
-ANALYSIS_WORKER_COUNT = 4  # New
-IMPLEMENTATION_WORKER_COUNT = 4 # New
-VJS_WORKER_COUNT = 2
-DATA_ASSEMBLY_WORKER_COUNT = 1 # New
+INGESTION_WORKER_COUNT = DEFAULT_INGESTION_WORKER_COUNT
+ANALYSIS_WORKER_COUNT = DEFAULT_ANALYSIS_WORKER_COUNT
+IMPLEMENTATION_WORKER_COUNT = DEFAULT_IMPLEMENTATION_WORKER_COUNT
+VJS_WORKER_COUNT = DEFAULT_VJS_WORKER_COUNT
+DATA_ASSEMBLY_WORKER_COUNT = DEFAULT_DATA_ASSEMBLY_WORKER_COUNT
 TOTAL_WORKER_COUNT = (INGESTION_WORKER_COUNT + ANALYSIS_WORKER_COUNT + 
                       IMPLEMENTATION_WORKER_COUNT + VJS_WORKER_COUNT + 
                       DATA_ASSEMBLY_WORKER_COUNT)
@@ -69,6 +74,26 @@ CREATE TABLE IF NOT EXISTS process_history (
     stage TEXT NOT NULL,
     event_type TEXT NOT NULL, -- e.g., 'START', 'SUCCESS', 'FAILURE', 'RETRY_LOGIC'
     details TEXT
+);
+"""
+
+CREATE_METRICS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    worker_pool TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    duration_ms INTEGER,
+    success BOOLEAN NOT NULL,
+    details_json TEXT
+);
+"""
+
+CREATE_DYNAMIC_CONFIG_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS dynamic_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    last_updated TEXT NOT NULL
 );
 """
 
@@ -151,6 +176,29 @@ def initialize_workers_table(cursor):
     except sqlite3.Error as e:
         logging.error(f"Failed to initialize worker slots: {e}")
 
+def populate_initial_dynamic_config(cursor):
+    """Sets the default values for the dynamic_config table."""
+    logging.info("Populating dynamic_config with default values...")
+    timestamp = datetime.now().isoformat()
+    
+    # Using config constants for default values
+    default_configs = [
+        ('ingestion_worker_count', str(DEFAULT_INGESTION_WORKER_COUNT), timestamp),
+        ('analysis_worker_count', str(DEFAULT_ANALYSIS_WORKER_COUNT), timestamp),
+        ('implementation_worker_count', str(DEFAULT_IMPLEMENTATION_WORKER_COUNT), timestamp),
+        ('vjs_worker_count', str(DEFAULT_VJS_WORKER_COUNT), timestamp),
+        ('analysis_batch_size', str(DEFAULT_ANALYSIS_BATCH_SIZE), timestamp),
+    ]
+    
+    try:
+        cursor.executemany(
+            "INSERT OR REPLACE INTO dynamic_config (key, value, last_updated) VALUES (?, ?, ?)",
+            default_configs
+        )
+        logging.info("Default dynamic configuration set successfully.")
+    except sqlite3.Error as e:
+        logging.error(f"Failed to set default dynamic config: {e}")
+
 def main():
     """Main function to set up and populate both databases."""
     for db_name in [PROGRESS_DB_NAME, WORKSPACE_DB_NAME]:
@@ -177,9 +225,12 @@ def main():
             cursor.execute(CREATE_WORKERS_TABLE_SQL)
             cursor.execute(CREATE_KEY_STATUS_TABLE_SQL)
             cursor.execute(CREATE_PROCESS_HISTORY_TABLE_SQL)
-            
+            cursor.execute(CREATE_METRICS_TABLE_SQL)
+            cursor.execute(CREATE_DYNAMIC_CONFIG_TABLE_SQL)
+
             if populate_problems_table(cursor):
                 initialize_workers_table(cursor)
+                populate_initial_dynamic_config(cursor)
                 logging.info(f"'{PROGRESS_DB_NAME}' setup complete.")
             else:
                 raise Exception("Failed to populate problems table.")

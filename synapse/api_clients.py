@@ -1,14 +1,16 @@
-# synapse/api_clients.py (Corrected Formatting)
+# synapse/api_clients.py (Phase 4 - Instrumented)
 import logging
 import time
 import json
 from typing import List, Dict, Any
 
-import google.generativeai as genai
+import google.generativai as genai
 from groq import Groq
 
+import synapse.database as db
 from synapse.key_manager import KeyManager, KeyStatus
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from google.generativai.types import HarmCategory, HarmBlockThreshold
+
 # --- Model Configuration ---
 GEMINI_MODEL_NAME = 'gemini-2.5-pro'
 GROQ_MODEL_NAME = "llama3-8b-8192"
@@ -55,11 +57,12 @@ You are a world-class competitive programmer. Your task is to implement a soluti
 """
 
 def call_gemini_analyst_batch(batch_data: List[Dict[str, Any]], key_manager: KeyManager) -> Dict[str, str]:
-    """Calls the Gemini API with a batch of problems, with adjusted safety settings."""
+    """Calls the Gemini API with a batch of problems, with performance logging."""
     estimated_tokens = len(str(batch_data))
-    
     managed_key = None
     response_text = ""
+    start_time = time.perf_counter()
+
     try:
         managed_key = key_manager.get_key(estimated_tokens)
         if not managed_key:
@@ -67,10 +70,7 @@ def call_gemini_analyst_batch(batch_data: List[Dict[str, Any]], key_manager: Key
 
         genai.configure(api_key=managed_key.key_string)
         model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-        
         prompt = GEMINI_ANALYST_BATCH_PROMPT.format(batch_input_json=json.dumps(batch_data, indent=2))
-
-        # --- NEW: Define permissive safety settings ---
         safety_settings = {
             HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -79,59 +79,48 @@ def call_gemini_analyst_batch(batch_data: List[Dict[str, Any]], key_manager: Key
         }
         
         logging.info(f"Calling Gemini Analyst with a batch of {len(batch_data)} problems (key: ...{managed_key.key_string[-4:]})")
-        
-        # --- MODIFIED: Pass safety_settings to the API call ---
         response = model.generate_content(prompt, safety_settings=safety_settings)
-        response_text = response.text 
-             # 1. Strip markdown code block formatting if it exists
-        cleaned_text = response_text.strip()
-        if cleaned_text.startswith("```json"):
-            cleaned_text = cleaned_text[7:]
-            if cleaned_text.endswith("```"):
-                cleaned_text = cleaned_text[:-3]
         
-        # 2. Find the start and end of the JSON object within the cleaned text
+        if not response.parts:
+            block_reason = response.prompt_feedback.block_reason.name if response.prompt_feedback else "Unknown"
+            raise Exception(f"Gemini API call was blocked. Reason: {block_reason}")
+
+        response_text = response.text
+        cleaned_text = response_text.strip().removeprefix("```json").removesuffix("```").strip()
+        
         json_start_index = cleaned_text.find('{')
         json_end_index = cleaned_text.rfind('}')
-        
         if json_start_index == -1 or json_end_index == -1:
-            raise ValueError(f"Could not find a valid JSON object in the model's response.")
-
+            raise ValueError("Could not find a valid JSON object in the model's response.")
         json_string = cleaned_text[json_start_index : json_end_index + 1]
-              
-        # --- NEW: Add a check for a blocked response before parsing ---
-        if not response.parts:
-            # This indicates the response was blocked despite the settings
-            block_reason = "Unknown"
-            if response.prompt_feedback:
-                block_reason = response.prompt_feedback.block_reason.name
-            raise Exception(f"Gemini API call was blocked. Reason: {block_reason}")
-            
-        key_manager.release_key(managed_key, KeyStatus.AVAILABLE, tokens_used=0) 
-        return json.loads(json_string)
-
-    except json.JSONDecodeError as e:
-
-        # This will now catch cases where the model ignores instructions and returns non-JSON
-        # Log the problematic response text for debugging
-        logging.error(f"Gemini API returned non-JSON response. Error: {e}")
-        logging.error(f"--- RAW RESPONSE START ---\n{response_text}\n--- RAW RESPONSE END ---")
         
-        if managed_key:
-             key_manager.release_key(managed_key, KeyStatus.RATE_LIMITED, tokens_used=0)
-        raise # Re-raise the exception to let the worker handle the failure
+        # TODO: Calculate actual tokens from Gemini response when available
+        key_manager.release_key(managed_key, KeyStatus.AVAILABLE, tokens_used=0)
+        
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        db.log_metric('ANALYSIS', 'api_call', duration_ms, True, {'service': 'gemini', 'batch_size': len(batch_data)})
+        
+        return json.loads(json_string)
 
     except Exception as e:
         if managed_key:
             key_manager.release_key(managed_key, KeyStatus.RATE_LIMITED, tokens_used=0)
+        
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        db.log_metric('ANALYSIS', 'api_call', duration_ms, False, {'service': 'gemini', 'error': str(e), 'batch_size': len(batch_data)})
+        
         logging.error(f"Gemini API batch call failed: {e}")
+        if "json" in str(e).lower():
+             logging.error(f"--- RAW RESPONSE START ---\n{response_text}\n--- RAW RESPONSE END ---")
         raise
 
 def call_groq_implementer(problem_html: str, pseudocode: str, vjs_report: str, key_manager: KeyManager) -> str:
-    """Calls the Groq API to generate C++ code."""
-    # TODO: Implement token estimation
-    estimated_tokens = len(problem_html) + len(pseudocode)
+    """Calls the Groq API to generate C++ code, with performance logging."""
+    # Estimate tokens based on a common heuristic (1 token ~= 4 chars)
+    estimated_tokens = (len(problem_html) + len(pseudocode)) // 4
     managed_key = None
+    start_time = time.perf_counter()
+
     try:
         managed_key = key_manager.get_key(estimated_tokens)
         if not managed_key:
@@ -150,12 +139,21 @@ def call_groq_implementer(problem_html: str, pseudocode: str, vjs_report: str, k
             model=GROQ_MODEL_NAME,
         )
         
-        # TODO: Calculate actual tokens
-        key_manager.release_key(managed_key, KeyStatus.AVAILABLE, tokens_used=0)
+        # Get actual token usage from the response
+        tokens_used = chat_completion.usage.total_tokens if chat_completion.usage else 0
+        key_manager.release_key(managed_key, KeyStatus.AVAILABLE, tokens_used=tokens_used)
+        
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        db.log_metric('IMPLEMENTATION', 'api_call', duration_ms, True, {'service': 'groq', 'tokens_used': tokens_used})
+
         return chat_completion.choices[0].message.content.strip()
 
     except Exception as e:
         if managed_key:
             key_manager.release_key(managed_key, KeyStatus.RATE_LIMITED, tokens_used=0)
+
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        db.log_metric('IMPLEMENTATION', 'api_call', duration_ms, False, {'service': 'groq', 'error': str(e)})
+
         logging.error(f"Groq API call failed: {e}")
         raise
