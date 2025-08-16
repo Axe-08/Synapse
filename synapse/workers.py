@@ -1,4 +1,4 @@
-# synapse/workers.py (Phase 4A - Fully Instrumented)
+# synapse/workers.py (Phase 4.5 - Structured Feedback)
 import logging
 import json
 import time
@@ -10,7 +10,7 @@ import synapse.database as db
 from synapse.scraper import get_authenticated_driver, fetch_problem_data
 from synapse.api_clients import call_gemini_analyst_batch, call_groq_implementer
 from synapse.key_manager import KeyManager
-from synapse.vjs import run_vjs, run_static_analysis
+from synapse.vjs import run_vjs, run_static_analysis, run_semantic_analysis
 from synapse.data_assembly import _assemble_golden_record, _parse_memory_limit, _parse_time_limit
 from synapse.data_manager import append_to_dataset
 
@@ -18,7 +18,8 @@ from synapse.data_manager import append_to_dataset
 from config import MAX_ANALYSIS_RETRIES, MAX_IMPLEMENTATION_RETRIES
 
 
-# --- STAGE 1: INGESTION ---
+# --- STAGE 1, 2, 3 (Ingestion, Analysis, Implementation) ---
+# ... (These worker functions remain unchanged) ...
 def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Queue):
     problem_id = problem['id']
     driver = None
@@ -66,7 +67,6 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Que
         browser_queue.put(driver)
         db.update_worker_status(worker_id, 'INGESTION', None, None, 'idle')
 
-# --- STAGE 2: ANALYSIS (BATCHED) ---
 def analysis_worker(batch: List[Dict[str, Any]], worker_id: int, gemini_km: KeyManager):
     batch_ids = [p['id'] for p in batch]
     logging.info(f"Starting analysis for batch of {len(batch_ids)}: {batch_ids}")
@@ -127,7 +127,6 @@ def analysis_worker(batch: List[Dict[str, Any]], worker_id: int, gemini_km: KeyM
     finally:
         db.update_worker_status(worker_id, 'ANALYSIS', None, None, 'idle')
 
-# --- STAGE 3: IMPLEMENTATION ---
 def implementation_worker(problem: Dict[str, Any], worker_id: int, groq_km: KeyManager):
     problem_id = problem['id']
     start_time = time.perf_counter()
@@ -170,6 +169,7 @@ def implementation_worker(problem: Dict[str, Any], worker_id: int, groq_km: KeyM
     finally:
         db.update_worker_status(worker_id, 'IMPLEMENTATION', None, None, 'idle')
 
+
 # --- STAGE 4: VJS (Verification & Judging Service) ---
 def vjs_worker(problem: Dict[str, Any], worker_id: int):
     problem_id = problem['id']
@@ -191,7 +191,6 @@ def vjs_worker(problem: Dict[str, Any], worker_id: int):
         try:
             vjs_result = run_vjs(problem_id, code, pretests, time_limit_ms, memory_limit_kb)
         finally:
-            # This metric is critical and must always be logged.
             duration_ms = int((time.perf_counter() - vjs_start_time) * 1000)
             success = vjs_result.get('status') == 'SUCCESS'
             db.log_metric('VJS', 'vjs_run', duration_ms, success, {'problem_id': problem_id, 'status': vjs_result.get('status')})
@@ -202,15 +201,61 @@ def vjs_worker(problem: Dict[str, Any], worker_id: int):
             db.update_worker_status(worker_id, 'VJS', problem_id, 'ANALYZING', 'active')
             ref_code = workspace_data.get('reference_solution_code')
             analysis_results = {
-                'reference_analysis': run_static_analysis(ref_code) if ref_code else {},
-                'reconstructed_analysis': run_static_analysis(code)
+                'reference_analysis': {
+                    'cppcheck': run_static_analysis(ref_code) if ref_code else {},
+                    'semantic': run_semantic_analysis(ref_code) if ref_code else {}
+                },
+                'reconstructed_analysis': {
+                    'cppcheck': run_static_analysis(code),
+                    'semantic': run_semantic_analysis(code)
+                }
             }
-            db.update_workspace_with_static_analysis(problem_id, json.dumps(analysis_results))
+            db.update_workspace_with_quality_analysis(problem_id, json.dumps(analysis_results))
             db.transition_to_pending_data_assembly(problem_id)
+        
+        # --- ENHANCEMENT START: Structured Feedback Generation ---
         elif vjs_result['status'] == 'COMPILE_ERROR':
-            db.transition_to_pending_implementation_retry(problem_id, vjs_result['report'])
+            feedback_report = (
+                "The previous code failed to compile. This is a critical error in syntax or library usage.\n"
+                "**Compiler Output:**\n"
+                "```\n"
+                f"{vjs_result['report']}\n"
+                "```\n"
+                "Analyze the error message carefully. Common causes include missing headers, incorrect syntax, or undeclared variables. Fix the code so it compiles successfully."
+            )
+            db.transition_to_pending_implementation_retry(problem_id, feedback_report)
+        
         elif vjs_result['status'] in ['TIME_LIMIT_EXCEEDED', 'WRONG_ANSWER', 'RUNTIME_ERROR']:
-            db.transition_to_pending_analysis_retry(problem_id, vjs_result['report'])
+            feedback_report = ""
+            if vjs_result['status'] == 'WRONG_ANSWER':
+                details = vjs_result.get('details', {})
+                feedback_report = (
+                    "The previous solution was functionally incorrect. It produced the wrong output for a specific test case.\n"
+                    "**Analysis of Failure on Test Case #{test_case}**:\n"
+                    "**Input:**\n"
+                    "```\n{input}\n```\n"
+                    "**Expected Output:**\n"
+                    "```\n{expected_output}\n```\n"
+                    "**Your Code's Output:**\n"
+                    "```\n{actual_output}\n```\n"
+                    "Your task is to re-evaluate the core algorithm and data structures. The logic is flawed. Find the bug in the reasoning that leads to this incorrect output and generate new, correct pseudocode."
+                ).format(
+                    test_case=details.get('test_case', 'N/A'),
+                    input=details.get('input', 'N/A'),
+                    expected_output=details.get('expected_output', 'N/A'),
+                    actual_output=details.get('actual_output', 'N/A')
+                )
+            else: # TLE or Runtime Error
+                feedback_report = (
+                    f"The previous solution failed with a '{vjs_result['status']}' verdict. This indicates a logical or algorithmic efficiency issue.\n"
+                    f"**Failure Type:** {vjs_result['status']}\n"
+                    f"**Report:** {vjs_result['report']}\n"
+                    "If it was a Time Limit Exceeded, the algorithm is too slow. Consider more efficient data structures or a different approach (e.g., dynamic programming instead of brute force). If it was a Runtime Error, the code may be accessing invalid memory or causing a crash. Re-evaluate the algorithm's logic for edge cases and constraints."
+                )
+            # This error points to a logical flaw, so it goes back to the Analyst
+            db.transition_to_pending_analysis_retry(problem_id, feedback_report)
+        # --- ENHANCEMENT END ---
+        
         else:
             raise Exception(f"VJS system error: {vjs_result.get('report', 'Unknown')}")
 
@@ -221,6 +266,7 @@ def vjs_worker(problem: Dict[str, Any], worker_id: int):
         db.update_worker_status(worker_id, 'VJS', None, None, 'idle')
 
 # --- STAGE 5: DATA ASSEMBLY ---
+# ... (This worker function remains unchanged) ...
 def data_assembly_worker(problem: Dict[str, Any], worker_id: int):
     problem_id = problem['id']
     start_time = time.perf_counter()

@@ -1,4 +1,4 @@
-# create_database.py (Phase 1 Revision)
+# create_database.py (Corrected)
 import sqlite3
 import requests
 import logging
@@ -13,10 +13,11 @@ from config import (
     DEFAULT_DATA_ASSEMBLY_WORKER_COUNT,
     DEFAULT_ANALYSIS_BATCH_SIZE,
     PROGRESS_DB_NAME,
-    WORKSPACE_DB_NAME,
+    WORKSPACE_DB_PATH, # <-- FIXED
     API_URL
 )
-# Worker pool configuration remains the single source of truth for concurrency
+
+# Worker pool configuration
 INGESTION_WORKER_COUNT = DEFAULT_INGESTION_WORKER_COUNT
 ANALYSIS_WORKER_COUNT = DEFAULT_ANALYSIS_WORKER_COUNT
 IMPLEMENTATION_WORKER_COUNT = DEFAULT_IMPLEMENTATION_WORKER_COUNT
@@ -40,7 +41,7 @@ CREATE TABLE IF NOT EXISTS problems (
     rating INTEGER,
     tags TEXT,
     status TEXT NOT NULL DEFAULT 'pending_ingestion',
-    retry_count INTEGER DEFAULT 0, -- Generic retry, for backward compatibility
+    retry_count INTEGER DEFAULT 0,
     analysis_try_count INTEGER DEFAULT 0,
     implementation_try_count INTEGER DEFAULT 0,
     last_vjs_report TEXT,
@@ -109,7 +110,7 @@ CREATE TABLE IF NOT EXISTS problem_data_cache (
     arl_reconstructed_code TEXT,
     arl_feedback TEXT,
     vjs_last_report TEXT,
-    static_analysis_json TEXT,
+    quality_analysis_json TEXT, -- RENAMED: To store cppcheck, CC, MI results
     time_limit_raw TEXT,
     memory_limit_raw TEXT
 );
@@ -181,7 +182,6 @@ def populate_initial_dynamic_config(cursor):
     logging.info("Populating dynamic_config with default values...")
     timestamp = datetime.now().isoformat()
     
-    # Using config constants for default values
     default_configs = [
         ('ingestion_worker_count', str(DEFAULT_INGESTION_WORKER_COUNT), timestamp),
         ('analysis_worker_count', str(DEFAULT_ANALYSIS_WORKER_COUNT), timestamp),
@@ -201,7 +201,7 @@ def populate_initial_dynamic_config(cursor):
 
 def main():
     """Main function to set up and populate both databases."""
-    for db_name in [PROGRESS_DB_NAME, WORKSPACE_DB_NAME]:
+    for db_name in [PROGRESS_DB_NAME, WORKSPACE_DB_PATH]:
         if os.path.exists(db_name):
             logging.warning(f"Database '{db_name}' already exists.")
             response = input(f"This script will DELETE and re-create '{db_name}'. Continue? (y/n): ").lower()
@@ -220,7 +220,7 @@ def main():
         logging.info(f"Setting up '{PROGRESS_DB_NAME}'...")
         with sqlite3.connect(PROGRESS_DB_NAME) as conn:
             cursor = conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL;") # Enable WAL Mode for better concurrency
+            cursor.execute("PRAGMA journal_mode=WAL;")
             cursor.execute(CREATE_PROBLEMS_TABLE_SQL)
             cursor.execute(CREATE_WORKERS_TABLE_SQL)
             cursor.execute(CREATE_KEY_STATUS_TABLE_SQL)
@@ -240,14 +240,14 @@ def main():
 
     # Setup workspace.db
     try:
-        logging.info(f"Setting up '{WORKSPACE_DB_NAME}'...")
-        with sqlite3.connect(WORKSPACE_DB_NAME) as conn:
+        logging.info(f"Setting up '{WORKSPACE_DB_PATH}'...")
+        with sqlite3.connect(WORKSPACE_DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL;") # Enable WAL Mode for better concurrency
+            cursor.execute("PRAGMA journal_mode=WAL;")
             cursor.execute(CREATE_WORKSPACE_TABLE_SQL)
-            logging.info(f"'{WORKSPACE_DB_NAME}' setup complete.")
+            logging.info(f"'{WORKSPACE_DB_PATH}' setup complete.")
     except Exception as e:
-        logging.critical(f"A critical error occurred with {WORKSPACE_DB_NAME}: {e}")
+        logging.critical(f"A critical error occurred with {WORKSPACE_DB_PATH}: {e}")
 
 if __name__ == "__main__":
     main()

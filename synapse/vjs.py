@@ -7,6 +7,9 @@ from typing import List, Dict
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
+import math
+import lizard # <-- NEW IMPORT
+
 # Initialize the Docker client from the environment
 try:
     client = docker.from_env()
@@ -15,6 +18,10 @@ except docker.errors.DockerException:
     client = None
 
 def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int, memory_limit_kb: int) -> dict:
+    """
+    Compiles and runs C++ code in a Docker sandbox against a set of pretests.
+    Returns a detailed dictionary with the outcome.
+    """
     if not client:
         return {'status': 'VJS_ERROR', 'report': 'Docker client not available.'}
 
@@ -55,15 +62,26 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
                 result = container.wait()
                 
                 if result['StatusCode'] == 124:
-                     return {'status': 'TIME_LIMIT_EXCEEDED', 'report': f'Time limit exceeded on test {i+1}'}
+                    return {'status': 'TIME_LIMIT_EXCEEDED', 'report': f'Time limit exceeded on test {i+1}'}
                 elif result['StatusCode'] != 0:
                     return {'status': 'RUNTIME_ERROR', 'report': f'Runtime error on test {i+1}'}
 
                 actual_output = container.logs(stdout=True, stderr=False).decode('utf-8', 'ignore').strip().replace('\r\n', '\n')
                 expected_output = test['output'].strip().replace('\r\n', '\n')
                 
+                # --- ENHANCEMENT START ---
                 if actual_output != expected_output:
-                    return {'status': 'WRONG_ANSWER', 'report': f'Wrong answer on test {i+1}'}
+                    return {
+                        'status': 'WRONG_ANSWER',
+                        'report': f'Wrong answer on test {i+1}',
+                        'details': {
+                            'test_case': i + 1,
+                            'input': test['input'],
+                            'expected_output': expected_output,
+                            'actual_output': actual_output
+                        }
+                    }
+                # --- ENHANCEMENT END ---
                 
                 container.remove()
                 container = None
@@ -71,40 +89,29 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
     except Exception as e:
         return {'status': 'VJS_ERROR', 'report': f'An unexpected VJS error occurred: {e}'}
     finally:
-        # --- NEW ROBUST CLEANUP ---
         if container:
-            try:
-                container.kill()
-            except docker.errors.APIError:
-                pass # Ignore error if container is already stopped
+            try: container.kill()
+            except docker.errors.APIError: pass
             finally:
-                try:
-                    container.remove()
-                except docker.errors.APIError:
-                    pass # Ignore error if container is already removed
+                try: container.remove()
+                except docker.errors.APIError: pass
         if os.path.exists(host_dir):
             shutil.rmtree(host_dir)
 
     return {'status': 'SUCCESS', 'report': f'All {len(pretests)} tests passed'}
 
 def run_static_analysis(code: str) -> dict:
-    """
-    Runs cppcheck on a given C++ code string and returns a structured summary.
-    """
-    # cppcheck writes its XML report to stderr, not stdout.
+    # ... (this function remains the same) ...
     temp_filepath = None
     try:
-        # Create a temporary file to store the code
         with tempfile.NamedTemporaryFile(mode='w+', suffix='.cpp', delete=False) as temp_f:
             temp_filepath = temp_f.name
             temp_f.write(code)
 
-        # Execute the cppcheck command
         cmd = ["cppcheck", f"--enable=all", "--xml", temp_filepath]
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         xml_output = result.stderr
 
-        # Parse the XML output
         summary = {'errors': [], 'error_counts': {}}
         if not xml_output:
             return summary
@@ -135,6 +142,44 @@ def run_static_analysis(code: str) -> dict:
         logging.error(f"An unexpected error occurred in run_static_analysis: {e}")
         return {'status': 'ANALYSIS_ERROR', 'report': str(e)}
     finally:
-        # Ensure the temporary file is always deleted
         if temp_filepath and os.path.exists(temp_filepath):
             os.remove(temp_filepath)
+
+# --- NEW FUNCTION ---
+def run_semantic_analysis(code: str) -> dict:
+    """
+    Performs semantic analysis on a C++ code string using 'lizard'.
+    Calculates Cyclomatic Complexity (CC), NLOC, and Maintainability Index (MI).
+    """
+    if not code:
+        return {}
+
+    try:
+        # Use lizard to analyze the code string directly
+        # The 'input.cpp' is just a placeholder filename for the analysis context
+        analysis = lizard.analyze_source_code("input.cpp", code)
+
+        if not analysis.function_list:
+            return {"error": "No functions found by lizard."}
+
+        # Aggregate metrics across all functions in the file
+        total_nloc = sum(f.nloc for f in analysis.function_list)
+        # We use the average complexity as a representative metric
+        avg_cyclomatic_complexity = sum(f.cyclomatic_complexity for f in analysis.function_list) / len(analysis.function_list)
+
+        # Calculate Maintainability Index (simplified version without Halstead)
+        # MI = 171 - 5.2 * log2(avg_volume) - 0.23 * avg_cc - 16.2 * log2(avg_loc)
+        # Since Halstead Volume is complex, we use a common variant that omits it.
+        # A higher MI score (0-100) is better.
+        mi_log_loc = math.log2(total_nloc) if total_nloc > 0 else 0
+        maintainability_index = 171 - (0.23 * avg_cyclomatic_complexity) - (16.2 * mi_log_loc)
+
+        return {
+            "avg_cyclomatic_complexity": round(avg_cyclomatic_complexity, 2),
+            "total_nloc": total_nloc,
+            "maintainability_index": round(max(0, maintainability_index * 100 / 171), 2),
+            "function_count": len(analysis.function_list)
+        }
+    except Exception as e:
+        logging.error(f"Lizard analysis failed: {e}")
+        return {"error": str(e)}

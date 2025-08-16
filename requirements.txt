@@ -72,6 +72,7 @@ idna==3.10
 iterative-telemetry==0.0.10
 jmespath==1.0.1
 kombu==5.5.4
+lizard==1.17.31
 markdown-it-py==4.0.0
 mdurl==0.1.2
 multidict==6.6.4

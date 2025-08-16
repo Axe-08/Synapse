@@ -176,6 +176,10 @@ def save_ingestion_data_to_workspace(problem_id: str, html: str, ref_solution_ob
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (problem_id, html, json.dumps(ref_solution_obj), ref_solution_code, json.dumps(pretests), time_limit_raw, memory_limit_raw)
         )
+def update_workspace_with_quality_analysis(problem_id: str, analysis_json: str):
+    """(Sync) Updates the workspace with combined quality analysis results."""
+    with _get_db_connection(WORKSPACE_DB_PATH) as conn:
+        conn.execute("UPDATE problem_data_cache SET quality_analysis_json = ? WHERE problem_id = ?", (analysis_json, problem_id))
 
 def get_batch_data_from_workspace(problem_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     with _get_db_connection(WORKSPACE_DB_PATH) as conn:

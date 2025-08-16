@@ -1,4 +1,5 @@
 # synapse/data_assembly.py
+import logging
 import json
 from bs4 import BeautifulSoup
 
@@ -9,13 +10,13 @@ SUBMISSION_URL_TEMPLATE = "https://codeforces.com/contest/{contestId}/submission
 def _parse_time_limit(text: str) -> int:
     try:
         return int(float(text.split()[0]) * 1000)
-    except:
+    except (ValueError, IndexError):
         return 0
 
 def _parse_memory_limit(text: str) -> int:
     try:
         return int(text.split()[0]) * 1024
-    except:
+    except (ValueError, IndexError):
         return 0
 
 def _assemble_golden_record(problem_id: str, workspace_data: dict) -> dict:
@@ -32,7 +33,6 @@ def _assemble_golden_record(problem_id: str, workspace_data: dict) -> dict:
     time_limit_raw = soup.find('div', class_='time-limit').text.replace('time limit per test', '').strip()
     memory_limit_raw = soup.find('div', class_='memory-limit').text.replace('memory limit per test', '').strip()
 
-    # --- NEW: Add static analysis results ---
     final_record = {
         "problem_id": problem_id,
         "problem_url": PROBLEM_URL_TEMPLATE.format(contestId=ref['problem']['contestId'], index=ref['problem']['index']),
@@ -48,19 +48,22 @@ def _assemble_golden_record(problem_id: str, workspace_data: dict) -> dict:
             "submission_url": SUBMISSION_URL_TEMPLATE.format(contestId=ref['contestId'], submissionId=ref['id']),
             "author_handle": ref['author']['members'][0]['handle'],
             "author_rating": ref['author'].get('rating', None),
-            "language": ref['programmingLanguage'], "code": "code_is_in_workspace_db"
+            "language": ref['programmingLanguage'],
+            "code": workspace_data.get('reference_solution_code') # Include the actual code
         },
         "verified_pseudocode": workspace_data.get('arl_pseudocode'),
         "verified_solution_code": workspace_data.get('arl_reconstructed_code')
     }
     
-    analysis_json = workspace_data.get('static_analysis_json')
+    # --- ENHANCEMENT START ---
+    # Add the new, combined quality analysis results to the final record
+    analysis_json = workspace_data.get('quality_analysis_json')
     if analysis_json:
         try:
             final_record['code_quality_analysis'] = json.loads(analysis_json)
         except json.JSONDecodeError:
-            logging.warning(f"Could not parse static_analysis_json for {problem_id}")
+            logging.warning(f"Could not parse quality_analysis_json for {problem_id}")
             final_record['code_quality_analysis'] = None
-    # --- End of New Step ---
+    # --- ENHANCEMENT END ---
 
     return final_record

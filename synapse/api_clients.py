@@ -1,4 +1,4 @@
-# synapse/api_clients.py (Phase 4 - Instrumented)
+# synapse/api_clients.py (Phase 4.5 - Final Prompts)
 import logging
 import time
 import json
@@ -24,7 +24,7 @@ You are an expert algorithm designer. Your task is to analyze a batch of C++ sol
 2.  For each problem, you must analyze the context and the code to understand the core algorithm.
 3.  Your output **MUST** be a single JSON object (a dictionary) where the keys are the `problem_id`s from the input, and the values are the corresponding pseudocode strings.
 4.  The pseudocode must be clear, step-by-step, and language-agnostic. Do NOT use C++ specific syntax. Focus on logic, data structures, and key operations.
-5.  If a problem has feedback from a previous failed attempt (`vjs_report`), use it to correct your logic.
+5.  If a problem has feedback from a previous failed attempt (`vjs_report`), it will contain a detailed analysis of the failure. You MUST use this information to create a new, corrected algorithm. The feedback is your most important clue.
 6.  Ensure your final output is a valid JSON that can be parsed directly. Do not include any text or explanations outside of the final JSON object.
 
 **INPUT BATCH:**
@@ -50,7 +50,8 @@ You are a world-class competitive programmer. Your task is to implement a soluti
 **PSEUDOCODE:**
 {pseudocode}
 
-**PREVIOUS COMPILE ERROR (VJS REPORT):**
+**PREVIOUS FAILED ATTEMPT (VJS REPORT):**
+This section contains feedback from the automated judge on your last attempt.Ignore this if report is empty. If it's a compile error, fix the syntax.
 {vjs_report}
 
 **C++ SOLUTION:**
@@ -94,7 +95,6 @@ def call_gemini_analyst_batch(batch_data: List[Dict[str, Any]], key_manager: Key
             raise ValueError("Could not find a valid JSON object in the model's response.")
         json_string = cleaned_text[json_start_index : json_end_index + 1]
         
-        # TODO: Calculate actual tokens from Gemini response when available
         key_manager.release_key(managed_key, KeyStatus.AVAILABLE, tokens_used=0)
         
         duration_ms = int((time.perf_counter() - start_time) * 1000)
@@ -116,7 +116,6 @@ def call_gemini_analyst_batch(batch_data: List[Dict[str, Any]], key_manager: Key
 
 def call_groq_implementer(problem_html: str, pseudocode: str, vjs_report: str, key_manager: KeyManager) -> str:
     """Calls the Groq API to generate C++ code, with performance logging."""
-    # Estimate tokens based on a common heuristic (1 token ~= 4 chars)
     estimated_tokens = (len(problem_html) + len(pseudocode)) // 4
     managed_key = None
     start_time = time.perf_counter()
@@ -139,7 +138,6 @@ def call_groq_implementer(problem_html: str, pseudocode: str, vjs_report: str, k
             model=GROQ_MODEL_NAME,
         )
         
-        # Get actual token usage from the response
         tokens_used = chat_completion.usage.total_tokens if chat_completion.usage else 0
         key_manager.release_key(managed_key, KeyStatus.AVAILABLE, tokens_used=tokens_used)
         

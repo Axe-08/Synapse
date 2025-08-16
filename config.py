@@ -4,8 +4,9 @@
 
 # --- Core Infrastructure & Database ---
 PROGRESS_DB_NAME = 'progress.db'
-WORKSPACE_DB_PATH = 'workspace.db'
+WORKSPACE_DB_PATH = 'workspace.db' # Correct variable name
 FINAL_DATASET_FILE = "dataset.jsonl"
+API_URL = "https://codeforces.com/api/problemset.problems" # ADDED
 
 # --- Worker Concurrency (Default Values & Limits) ---
 # These are the primary "levers" the optimizer can adjust.
@@ -35,7 +36,7 @@ DEFAULT_SELENIUM_SHORT_WAIT = 10
 VJS_COMPILATION_TIMEOUT = 15
 
 # -----------------------------------------------------------------------------
-# --- NEW: Optimizer & Control System Configuration ---
+# --- Optimizer & Control System Configuration ---
 # -----------------------------------------------------------------------------
 
 # --- Optimizer Settings ---
