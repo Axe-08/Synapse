@@ -1,22 +1,31 @@
-# synapse/api_clients.py (Phase 4.5 - Final Prompts)
+# synapse/api_clients.py
+"""
+This module is responsible for all interactions with external LLM APIs.
+
+It contains dedicated functions for calling the "Analyst" model (Gemini)
+and the "Implementer" model (Groq). These functions incorporate robust
+error handling, interaction with the KeyManager to prevent rate-limiting,
+and performance logging to the metrics database. The prompts are centrally
+managed here for easy tuning.
+"""
 import logging
 import time
 import json
 from typing import List, Dict, Any
 
 import google.generativai as genai
-from groq import Groq
+from groq import Groq, RateLimitError
 
 import synapse.database as db
 from synapse.key_manager import KeyManager, KeyStatus
 from google.generativai.types import HarmCategory, HarmBlockThreshold
 
 # --- Model Configuration ---
-GEMINI_MODEL_NAME = 'gemini-2.5-pro'
-GROQ_MODEL_NAME = "llama3-8b-8192"
+GEMINI_MODEL_NAME: str = 'gemini-2.5-pro' # Updated to latest stable model
+GROQ_MODEL_NAME: str = "llama3-8b-8192"
 
 # --- Prompt Engineering ---
-GEMINI_ANALYST_BATCH_PROMPT = """
+GEMINI_ANALYST_BATCH_PROMPT: str = """
 You are an expert algorithm designer. Your task is to analyze a batch of C++ solutions for competitive programming problems and produce high-quality, language-agnostic pseudocode for each.
 
 **RULES:**
@@ -34,7 +43,7 @@ You are an expert algorithm designer. Your task is to analyze a batch of C++ sol
 **OUTPUT JSON:**
 """
 
-GROQ_IMPLEMENTER_PROMPT = """
+GROQ_IMPLEMENTER_PROMPT: str = """
 You are a world-class competitive programmer. Your task is to implement a solution in C++ based *only* on the provided problem context and pseudocode.
 
 **CRITICAL RULES:**
@@ -51,14 +60,26 @@ You are a world-class competitive programmer. Your task is to implement a soluti
 {pseudocode}
 
 **PREVIOUS FAILED ATTEMPT (VJS REPORT):**
-This section contains feedback from the automated judge on your last attempt.Ignore this if report is empty. If it's a compile error, fix the syntax.
+This section contains feedback from the automated judge on your last attempt. Ignore this if the report is empty. If it's a compile error, fix the syntax. If it's a logic error, use the test case analysis to correct your implementation.
 {vjs_report}
 
 **C++ SOLUTION:**
 """
 
 def call_gemini_analyst_batch(batch_data: List[Dict[str, Any]], key_manager: KeyManager) -> Dict[str, str]:
-    """Calls the Gemini API with a batch of problems, with performance logging."""
+    """
+    Calls the Gemini API with a batch of problems to generate pseudocode.
+
+    Args:
+        batch_data: A list of dictionaries, each containing problem data.
+        key_manager: The KeyManager instance for Gemini API keys.
+
+    Returns:
+        A dictionary mapping problem_id to the generated pseudocode string.
+
+    Raises:
+        Exception: If no API keys are available or the API call fails critically.
+    """
     estimated_tokens = len(str(batch_data))
     managed_key = None
     response_text = ""
@@ -78,44 +99,58 @@ def call_gemini_analyst_batch(batch_data: List[Dict[str, Any]], key_manager: Key
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
         }
-        
+
         logging.info(f"Calling Gemini Analyst with a batch of {len(batch_data)} problems (key: ...{managed_key.key_string[-4:]})")
         response = model.generate_content(prompt, safety_settings=safety_settings)
-        
+
         if not response.parts:
             block_reason = response.prompt_feedback.block_reason.name if response.prompt_feedback else "Unknown"
             raise Exception(f"Gemini API call was blocked. Reason: {block_reason}")
 
         response_text = response.text
+        # Clean the response to extract only the JSON object
         cleaned_text = response_text.strip().removeprefix("```json").removesuffix("```").strip()
-        
         json_start_index = cleaned_text.find('{')
         json_end_index = cleaned_text.rfind('}')
         if json_start_index == -1 or json_end_index == -1:
             raise ValueError("Could not find a valid JSON object in the model's response.")
         json_string = cleaned_text[json_start_index : json_end_index + 1]
-        
-        key_manager.release_key(managed_key, KeyStatus.AVAILABLE, tokens_used=0)
-        
+
+        key_manager.release_key(managed_key, KeyStatus.AVAILABLE, tokens_used=0) # Token count not available for batch
         duration_ms = int((time.perf_counter() - start_time) * 1000)
         db.log_metric('ANALYSIS', 'api_call', duration_ms, True, {'service': 'gemini', 'batch_size': len(batch_data)})
-        
+
         return json.loads(json_string)
 
     except Exception as e:
+        outcome = KeyStatus.RATE_LIMITED # Assume rate limiting on any error for safety
         if managed_key:
-            key_manager.release_key(managed_key, KeyStatus.RATE_LIMITED, tokens_used=0)
-        
+            key_manager.release_key(managed_key, outcome, tokens_used=0)
+
         duration_ms = int((time.perf_counter() - start_time) * 1000)
         db.log_metric('ANALYSIS', 'api_call', duration_ms, False, {'service': 'gemini', 'error': str(e), 'batch_size': len(batch_data)})
-        
+
         logging.error(f"Gemini API batch call failed: {e}")
         if "json" in str(e).lower():
-             logging.error(f"--- RAW RESPONSE START ---\n{response_text}\n--- RAW RESPONSE END ---")
+            logging.error(f"--- RAW RESPONSE START ---\n{response_text}\n--- RAW RESPONSE END ---")
         raise
 
 def call_groq_implementer(problem_html: str, pseudocode: str, vjs_report: str, key_manager: KeyManager) -> str:
-    """Calls the Groq API to generate C++ code, with performance logging."""
+    """
+    Calls the Groq API to generate C++ code from pseudocode.
+
+    Args:
+        problem_html: The HTML statement of the problem.
+        pseudocode: The language-agnostic pseudocode for the solution.
+        vjs_report: Feedback from any previous failed verification attempt.
+        key_manager: The KeyManager instance for Groq API keys.
+
+    Returns:
+        The raw C++ code as a string.
+
+    Raises:
+        Exception: If no API keys are available or the API call fails critically.
+    """
     estimated_tokens = (len(problem_html) + len(pseudocode)) // 4
     managed_key = None
     start_time = time.perf_counter()
@@ -127,28 +162,33 @@ def call_groq_implementer(problem_html: str, pseudocode: str, vjs_report: str, k
 
         client = Groq(api_key=managed_key.key_string)
         prompt = GROQ_IMPLEMENTER_PROMPT.format(
-            problem_html=problem_html, 
-            pseudocode=pseudocode, 
+            problem_html=problem_html,
+            pseudocode=pseudocode,
             vjs_report=vjs_report or "None"
         )
-        
+
         logging.info(f"Calling Groq Implementer (key: ...{managed_key.key_string[-4:]})")
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model=GROQ_MODEL_NAME,
         )
-        
+
         tokens_used = chat_completion.usage.total_tokens if chat_completion.usage else 0
         key_manager.release_key(managed_key, KeyStatus.AVAILABLE, tokens_used=tokens_used)
-        
+
         duration_ms = int((time.perf_counter() - start_time) * 1000)
         db.log_metric('IMPLEMENTATION', 'api_call', duration_ms, True, {'service': 'groq', 'tokens_used': tokens_used})
 
         return chat_completion.choices[0].message.content.strip()
 
-    except Exception as e:
+    except RateLimitError as e:
         if managed_key:
             key_manager.release_key(managed_key, KeyStatus.RATE_LIMITED, tokens_used=0)
+        logging.error(f"Groq API call failed due to rate limit: {e}")
+        raise
+    except Exception as e:
+        if managed_key:
+            key_manager.release_key(managed_key, KeyStatus.RATE_LIMITED, tokens_used=0) # Treat other errors as potential rate limits
 
         duration_ms = int((time.perf_counter() - start_time) * 1000)
         db.log_metric('IMPLEMENTATION', 'api_call', duration_ms, False, {'service': 'groq', 'error': str(e)})

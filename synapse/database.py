@@ -1,47 +1,65 @@
-# synapse/database.py (Phase 4A - Refactored for Async Writes)
+# synapse/database.py
+"""
+Data Access Layer (DAL) for the Project Synapse databases.
+
+This module provides a centralized and abstracted interface for all database
+interactions. It is designed for high-concurrency environments by separating
+read and write operations:
+
+-   **Asynchronous Writes:** Most state updates and logging operations are
+    delegated to the `db_writer` service. This service uses a single-threaded
+    queue to serialize all writes to `progress.db`, preventing
+    'database is locked' errors.
+-   **Synchronous Reads/Atomic Operations:** Operations that need to read data
+    or perform a critical, atomic read-then-write (like `get_next_jobs`)
+    connect directly to the database. These are designed to be fast to
+    minimize lock contention.
+
+All connections use WAL (Write-Ahead Logging) mode, which allows readers to
+operate without being blocked by writers.
+"""
 import sqlite3
 from datetime import datetime
 import logging
 import json
 from typing import List, Dict, Any, Optional
 
-from synapse.database_writer import db_writer # Import the new writer service
+from synapse.database_writer import db_writer
 
-PROGRESS_DB_PATH = 'progress.db'
-WORKSPACE_DB_PATH = 'workspace.db'
+PROGRESS_DB_PATH: str = 'progress.db'
+WORKSPACE_DB_PATH: str = 'workspace.db'
 
-# --- Connection Management (for READS and ATOMIC operations) ---
+# --- Connection Management ---
 def _get_db_connection(db_path: str) -> sqlite3.Connection:
     """Establishes a connection to a SQLite database, enabling WAL mode."""
     conn = sqlite3.connect(db_path, timeout=15)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
-# --- ASYNC WRITE Operations (progress.db) ---
-# These functions enqueue their operations and do not block.
+# --- ASYNC WRITE Operations (Delegated to db_writer) ---
 
-def update_worker_status(worker_id: int, pool: str, problem_id: Optional[str], stage: Optional[str], status: str):
-    """(Async) Updates the live status of a single worker."""
+def update_worker_status(worker_id: int, pool: str, problem_id: Optional[str], stage: Optional[str], status: str) -> None:
+    """(Async) Updates the live status of a single worker in the `live_workers` table."""
     timestamp = datetime.now().isoformat()
     sql = "UPDATE live_workers SET problem_id = ?, stage = ?, status = ?, last_heartbeat = ? WHERE worker_id = ? AND pool = ?"
     params = (problem_id, stage, status, timestamp, worker_id, pool)
     db_writer.execute(sql, params)
 
-def reset_all_workers_to_idle():
-    """(Async) Resets all workers to idle at the start of a run."""
+def reset_all_workers_to_idle() -> None:
+    """(Async) Resets all workers to 'idle' at the start of a pipeline run."""
     logging.info("Resetting all worker statuses to 'idle'.")
     timestamp = datetime.now().isoformat()
     sql = "UPDATE live_workers SET problem_id = NULL, stage = NULL, status = 'idle', last_heartbeat = ?"
     db_writer.execute(sql, (timestamp,))
 
-def _update_problem_status(problem_id: str, new_status: str, extra_updates: Optional[Dict[str, Any]] = None):
+def _update_problem_status(problem_id: str, new_status: str, extra_updates: Optional[Dict[str, Any]] = None) -> None:
     """(Async) Generic internal function to update a problem's status and other fields."""
     timestamp = datetime.now().isoformat()
     base_query = "UPDATE problems SET status = ?, last_updated = ?"
     params = [new_status, timestamp]
     if extra_updates:
         for col, val in extra_updates.items():
-            if col in ['analysis_try_count', 'implementation_try_count']:
+            if col in ['analysis_try_count', 'implementation_try_count', 'rescraping_attempts']:
                 base_query += f", {col} = {col} + ?"
             else:
                 base_query += f", {col} = ?"
@@ -50,32 +68,30 @@ def _update_problem_status(problem_id: str, new_status: str, extra_updates: Opti
     params.append(problem_id)
     db_writer.execute(base_query, tuple(params))
 
-def save_process_history(problem_id: str, stage: str, event_type: str, details: str):
-    """(Async) Logs a significant event in a problem's lifecycle."""
+def save_process_history(problem_id: str, stage: str, event_type: str, details: str) -> None:
+    """(Async) Logs a significant event in a problem's lifecycle to the `process_history` table."""
     timestamp = datetime.now().isoformat()
     sql = "INSERT INTO process_history (timestamp, problem_id, stage, event_type, details) VALUES (?, ?, ?, ?, ?)"
     params = (timestamp, problem_id, stage, event_type, details)
     db_writer.execute(sql, params)
 
-def log_metric(worker_pool: str, event_type: str, duration_ms: Optional[int], success: bool, details: Optional[Dict] = None):
-    """(Async) Logs a performance or event metric to the database."""
+def log_metric(worker_pool: str, event_type: str, duration_ms: Optional[int], success: bool, details: Optional[Dict] = None) -> None:
+    """(Async) Logs a performance or event metric to the `metrics` table."""
     timestamp = datetime.now().isoformat()
     details_json = json.dumps(details) if details else None
     sql = "INSERT INTO metrics (timestamp, worker_pool, event_type, duration_ms, success, details_json) VALUES (?, ?, ?, ?, ?, ?)"
     params = (timestamp, worker_pool, event_type, duration_ms, success, details_json)
     db_writer.execute(sql, params)
 
-# --- SYNCHRONOUS Operations ---
-# These functions block and interact with the DB directly.
-# Used for reads or critical atomic read-then-write operations.
+# --- SYNCHRONOUS / ATOMIC Operations ---
 
 def get_next_jobs(status: str, limit: int) -> List[Dict[str, Any]]:
     """
     (Sync & Atomic) Fetches and locks the next available jobs for a given stage.
-    This MUST remain synchronous to prevent race conditions.
+    This operation MUST remain synchronous to prevent race conditions between
+    orchestrator threads trying to claim the same jobs.
     """
     new_status = f"in_progress_{status.split('_')[-1]}"
-    # This operation is critical and must be atomic, so it uses a direct connection.
     with _get_db_connection(PROGRESS_DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("BEGIN;")
@@ -88,17 +104,16 @@ def get_next_jobs(status: str, limit: int) -> List[Dict[str, Any]]:
             if not rows:
                 conn.commit()
                 return []
-            
+
             problem_ids = [row[0] for row in rows]
             jobs_to_process = [{'id': row[0], 'rating': row[1]} for row in rows]
-            
+
             timestamp = datetime.now().isoformat()
             placeholders = ','.join('?' for _ in problem_ids)
             update_query = f"UPDATE problems SET status = ?, last_updated = ? WHERE id IN ({placeholders})"
-            
             cursor.execute(update_query, (new_status, timestamp, *problem_ids))
+
             conn.commit()
-            
             logging.info(f"Locked {len(jobs_to_process)} problems for stage '{status}'.")
             return jobs_to_process
         except sqlite3.Error as e:
@@ -106,25 +121,7 @@ def get_next_jobs(status: str, limit: int) -> List[Dict[str, Any]]:
             logging.error(f"Failed to get next jobs atomically: {e}", exc_info=True)
             return []
 
-def get_dynamic_config() -> Dict[str, Any]:
-    """(Sync) Reads the entire dynamic configuration from the database."""
-    try:
-        with _get_db_connection(PROGRESS_DB_PATH) as conn:
-            cursor = conn.execute("SELECT key, value FROM dynamic_config")
-            rows = cursor.fetchall()
-            config = {}
-            for key, value in rows:
-                try:
-                    config[key] = int(value)
-                except (ValueError, TypeError):
-                    config[key] = value
-            return config
-    except sqlite3.Error as e:
-        logging.error(f"Could not read dynamic_config, returning empty dict: {e}")
-        return {}
-
 # --- Problem State Transition Wrappers ---
-# These functions provide a clean API for workers and internally call the async writers.
 
 def transition_to_pending_analysis(problem_id: str):
     _update_problem_status(problem_id, 'pending_analysis')
@@ -138,7 +135,7 @@ def transition_batch_to_pending_implementation(problem_ids: List[str]):
 def transition_to_pending_vjs(problem_id: str):
     _update_problem_status(problem_id, 'pending_vjs', {'implementation_try_count': 1})
     save_process_history(problem_id, 'IMPLEMENTATION', 'SUCCESS', 'Code generated. Ready for VJS.')
-    
+
 def transition_to_pending_implementation_retry(problem_id: str, report: str):
     _update_problem_status(problem_id, 'pending_implementation', {'last_vjs_report': report})
     save_process_history(problem_id, 'VJS', 'RETRY_LOOP', f'Syntax/Compile error. Retrying. Report: {report[:500]}')
@@ -161,13 +158,7 @@ def transition_to_failed(problem_id: str, stage: str, notes: str):
     save_process_history(problem_id, stage.upper(), 'FAILURE', f'Failed with error: {notes[:1000]}')
 
 def transition_to_pending_rescraping(problem_id: str, failed_submission_id: str):
-    """
-    (Async) Transitions a problem to the re-scraping state after analysis retries are exhausted.
-    It increments the rescraping attempt counter and logs the failed submission ID.
-    """
-    # This logic needs to read the current state before writing, so it's a special case.
-    # We will perform the read synchronously and then enqueue the async write.
-    
+    """(Hybrid) Transitions a problem to re-scraping after max analysis retries."""
     current_tried_ids = ""
     try:
         with _get_db_connection(PROGRESS_DB_PATH) as conn:
@@ -178,48 +169,39 @@ def transition_to_pending_rescraping(problem_id: str, failed_submission_id: str)
     except sqlite3.Error as e:
         logging.error(f"Could not read tried_submission_ids for {problem_id}: {e}")
 
-    # Append the new failed ID
     new_tried_ids = f"{current_tried_ids},{failed_submission_id}".strip(',')
-
-    extra_updates = {
-        'rescraping_attempts': 1, # Increments by 1
+    _update_problem_status(problem_id, 'pending_rescraping', {
+        'rescraping_attempts': 1,
         'tried_submission_ids': new_tried_ids
-    }
-    _update_problem_status(problem_id, 'pending_rescraping', extra_updates)
-    save_process_history(problem_id, 'ANALYSIS', 'FAILURE_LOOP', f'Analysis failed max retries. Attempting to find new reference solution. Failed submission: {failed_submission_id}.')
+    })
+    save_process_history(problem_id, 'ANALYSIS', 'FAILURE_LOOP', f'Analysis failed max retries. Attempting to find new reference. Failed submission: {failed_submission_id}.')
 
 def reset_retry_counts(problem_id: str):
-    """(Async) Resets the analysis and implementation retry counts for a problem after a successful re-scrape."""
+    """(Async) Resets retry counts after a successful re-scrape."""
     extra_updates = {
-        'analysis_try_count': 0,
-        'implementation_try_count': 0,
-        'last_vjs_report': '' # Clear the old report
+        'analysis_try_count': 0, 'implementation_try_count': 0, 'last_vjs_report': ''
     }
-    # We don't change the status here, just reset the counters.
-    # The worker will handle the final status transition.
     timestamp = datetime.now().isoformat()
-    base_query = "UPDATE problems SET last_updated = ?, analysis_try_count = ?, implementation_try_count = ?, last_vjs_report = ? WHERE id = ?"
+    sql = "UPDATE problems SET last_updated = ?, analysis_try_count = ?, implementation_try_count = ?, last_vjs_report = ? WHERE id = ?"
     params = (timestamp, 0, 0, '', problem_id)
-    db_writer.execute(base_query, params)
+    db_writer.execute(sql, params)
 
 def transition_to_quarantined(problem_id: str, reason: str):
-    new_status = "quarantined"
-    _update_problem_status(problem_id, new_status, {'notes': reason})
+    _update_problem_status(problem_id, "quarantined", {'notes': reason})
     save_process_history(problem_id, 'SYSTEM', 'QUARANTINED', f'Quarantined due to: {reason}')
 
 # --- Workspace Data Management (workspace.db) ---
-# These are less contended and can remain synchronous for simplicity.
 
 def save_ingestion_data_to_workspace(problem_id: str, html: str, ref_solution_obj: dict, ref_solution_code: str, pretests: list, time_limit_raw: str, memory_limit_raw: str):
     with _get_db_connection(WORKSPACE_DB_PATH) as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO problem_data_cache 
-               (problem_id, problem_statement_html, reference_solution_json, reference_solution_code, pretests_json, time_limit_raw, memory_limit_raw) 
+            """INSERT OR REPLACE INTO problem_data_cache
+               (problem_id, problem_statement_html, reference_solution_json, reference_solution_code, pretests_json, time_limit_raw, memory_limit_raw)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (problem_id, html, json.dumps(ref_solution_obj), ref_solution_code, json.dumps(pretests), time_limit_raw, memory_limit_raw)
         )
+
 def update_workspace_with_quality_analysis(problem_id: str, analysis_json: str):
-    """(Sync) Updates the workspace with combined quality analysis results."""
     with _get_db_connection(WORKSPACE_DB_PATH) as conn:
         conn.execute("UPDATE problem_data_cache SET quality_analysis_json = ? WHERE problem_id = ?", (analysis_json, problem_id))
 
@@ -229,11 +211,7 @@ def get_batch_data_from_workspace(problem_ids: List[str]) -> Dict[str, Dict[str,
         placeholders = ','.join('?' for _ in problem_ids)
         cursor = conn.execute(f"SELECT * FROM problem_data_cache WHERE problem_id IN ({placeholders})", problem_ids)
         rows = cursor.fetchall()
-        return {row['problem_id']: dict(row) for row in rows} if rows else {}
-
-def update_workspace_with_static_analysis(problem_id: str, analysis_json: str):
-    with _get_db_connection(WORKSPACE_DB_PATH) as conn:
-        conn.execute("UPDATE problem_data_cache SET static_analysis_json = ? WHERE problem_id = ?", (analysis_json, problem_id))
+        return {row['problem_id']: dict(row) for row in rows}
 
 def update_workspace_with_analysis_results(problem_id: str, pseudocode: str):
     with _get_db_connection(WORKSPACE_DB_PATH) as conn:
