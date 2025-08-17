@@ -31,7 +31,12 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-from config import DEFAULT_SELENIUM_LONG_WAIT, DEFAULT_SELENIUM_SHORT_WAIT, DEFAULT_SCRAPER_REQUEST_TIMEOUT
+from config import DEFAULT_SELENIUM_LONG_WAIT, DEFAULT_SELENIUM_SHORT_WAIT, DEFAULT_SCRAPER_REQUEST_TIMEOUT, DEFAULT_SCRAPER_DELAY_SECONDS
+import synapse.database as db # To log the ban event
+
+class IPBanException(Exception):
+    """Custom exception for IP bans."""
+    pass
 
 # Suppress noisy logs from Selenium
 logging.getLogger('selenium.webdriver.remote.remote_connection').setLevel(logging.WARNING)
@@ -65,11 +70,19 @@ def fetch_problem_page_details(contest_id: int, problem_index: str) -> dict:
         A dictionary containing the problem statement HTML, raw limits, and
         any example pretests found on the page. Returns an empty dict on failure.
     """
+    delay = config_manager.get_param('scraper_delay_seconds', DEFAULT_SCRAPER_DELAY_SECONDS)
+    time.sleep(delay)
+
     url = PROBLEM_URL_TEMPLATE.format(contestId=contest_id, index=problem_index)
     logging.info(f"Scraping problem page: {url}")
     try:
         response = requests.get(url, headers={'User-Agent': MY_USER_AGENT}, timeout=DEFAULT_SCRAPER_REQUEST_TIMEOUT)
         response.raise_for_status()
+        if "blocked by administrator" in response.text.lower() or "you have been blocked" in response.text.lower():
+            logging.critical(f"IP BAN DETECTED from URL: {url}")
+            db.log_metric('INGESTION', 'scrape_blocked', 0, False, {'url': url})
+            raise IPBanException("Scraper was blocked by administrator.")
+
         soup = BeautifulSoup(response.content, 'html.parser')
 
         problem_statement_div = soup.find('div', class_='problem-statement')
@@ -97,6 +110,8 @@ def fetch_problem_page_details(contest_id: int, problem_index: str) -> dict:
         }
     except Exception as e:
         logging.error(f"Failed to scrape problem page {url}: {e}")
+        if isinstance(e, IPBanException):
+            raise
         return {}
 
 

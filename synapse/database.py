@@ -168,6 +168,20 @@ def transition_to_failed(problem_id: str, stage: str, notes: str):
     _update_problem_status(problem_id, new_status, {'notes': notes})
     save_process_history(problem_id, stage.upper(), 'FAILURE', f'Failed with error: {notes[:1000]}')
 
+def transition_to_pending_calibration(problem_id: str):
+    _update_problem_status(problem_id, 'pending_calibration')
+    save_process_history(problem_id, 'INGESTION', 'SUCCESS', 'Data ingested. Ready for calibration.')
+
+# --- ADD THIS NEW WORKSPACE SAVE FUNCTION ---
+def save_calibration_results(problem_id: str, validated_pretests: List[Dict], slowness_factor: float):
+    """Saves the output of a successful calibration stage to the workspace."""
+    with _get_db_connection(WORKSPACE_DB_PATH) as conn:
+        conn.execute(
+            """UPDATE problem_data_cache 
+               SET validated_pretests_json = ?, slowness_factor = ?
+               WHERE problem_id = ?""",
+            (json.dumps(validated_pretests), slowness_factor, problem_id)
+        )
 def transition_to_pending_rescraping(problem_id: str, failed_submission_id: str):
     """(Hybrid) Transitions a problem to re-scraping after max analysis retries."""
     current_tried_ids = ""

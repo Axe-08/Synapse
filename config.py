@@ -38,6 +38,8 @@ MAX_RESCRAPING_ATTEMPTS: int = 2
 DEFAULT_SCRAPER_REQUEST_TIMEOUT: int = 40
 DEFAULT_SELENIUM_LONG_WAIT: int = 120
 DEFAULT_SELENIUM_SHORT_WAIT: int = 10
+DEFAULT_SCRAPER_DELAY_SECONDS: float = 2.5
+MAX_SCRAPER_DELAY_SECONDS: float = 10.0
 # --- VJS Timeouts (in seconds) ---
 VJS_COMPILATION_TIMEOUT: int = 15
 # -----------------------------------------------------------------------------

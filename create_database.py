@@ -113,7 +113,9 @@ CREATE TABLE IF NOT EXISTS problem_data_cache (
     vjs_last_report TEXT,
     quality_analysis_json TEXT, -- To store cppcheck, CC, MI results
     time_limit_raw TEXT,
-    memory_limit_raw TEXT
+    memory_limit_raw TEXT,
+    validated_pretests_json TEXT,
+    slowness_factor REAL 
 );
 """
 
@@ -204,6 +206,7 @@ def populate_initial_dynamic_config(cursor: sqlite3.Cursor) -> None:
         ('vjs_worker_count', str(DEFAULT_VJS_WORKER_COUNT), timestamp),
         ('data_assembly_worker_count', str(DEFAULT_DATA_ASSEMBLY_WORKER_COUNT), timestamp),
         ('analysis_batch_size', str(DEFAULT_ANALYSIS_BATCH_SIZE), timestamp),
+        ('scraper_delay_seconds', str(config.DEFAULT_SCRAPER_DELAY_SECONDS), timestamp),
     ]
     try:
         cursor.executemany(
