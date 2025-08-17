@@ -187,6 +187,7 @@ def _get_source_from_page(driver: uc.Chrome, url: str) -> Optional[str]:
         driver.get(url)
         wait = WebDriverWait(driver, DEFAULT_SELENIUM_SHORT_WAIT)
         code_element = wait.until(EC.presence_of_element_located((By.ID, "program-source-text")))
+        time.sleep(0.5)
         final_text = code_element.text.strip()
         if not final_text or final_text == "N/A":
             logging.error("Source code element found but content was empty or 'N/A'.")

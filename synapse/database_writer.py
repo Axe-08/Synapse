@@ -28,6 +28,14 @@ class DatabaseWriter:
         self._queue: Queue[Tuple[str, Tuple[Any, ...]] | object] = Queue()
         self._thread: Optional[threading.Thread] = None
 
+    def set_db_path(self, db_path: str) -> None:
+        """Sets the database path. Can only be called before the thread is started."""
+        if self._thread and self._thread.is_alive():
+            logging.error("Cannot change the database path while the writer thread is running.")
+            return
+        self._db_path = db_path
+        logging.info(f"Database writer path set to: {self._db_path}")
+
     def _worker_loop(self) -> None:
         """
         The main loop for the consumer thread.

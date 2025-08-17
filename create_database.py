@@ -21,25 +21,18 @@ from config import (
     DEFAULT_ANALYSIS_BATCH_SIZE,
     PROGRESS_DB_NAME,
     WORKSPACE_DB_PATH,
-    API_URL
-)
-
-# --- Worker Pool Configuration ---
-INGESTION_WORKER_COUNT: int = DEFAULT_INGESTION_WORKER_COUNT
-ANALYSIS_WORKER_COUNT: int = DEFAULT_ANALYSIS_WORKER_COUNT
-IMPLEMENTATION_WORKER_COUNT: int = DEFAULT_IMPLEMENTATION_WORKER_COUNT
-VJS_WORKER_COUNT: int = DEFAULT_VJS_WORKER_COUNT
-DATA_ASSEMBLY_WORKER_COUNT: int = DEFAULT_DATA_ASSEMBLY_WORKER_COUNT
-TOTAL_WORKER_COUNT: int = (
-    INGESTION_WORKER_COUNT + ANALYSIS_WORKER_COUNT +
-    IMPLEMENTATION_WORKER_COUNT + VJS_WORKER_COUNT +
-    DATA_ASSEMBLY_WORKER_COUNT
+    API_URL,
+    # BUGFIX: Import MAX values for worker initialization
+    MAX_INGESTION_WORKERS,
+    MAX_ANALYSIS_WORKERS,
+    MAX_IMPLEMENTATION_WORKERS,
+    MAX_VJS_WORKERS,
+    MAX_DATA_ASSEMBLY_WORKERS,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Schemas ---
-
 # -- progress.db Schemas --
 CREATE_PROBLEMS_TABLE_SQL: str = """
 CREATE TABLE IF NOT EXISTS problems (
@@ -62,7 +55,7 @@ CREATE TABLE IF NOT EXISTS problems (
 """
 CREATE_WORKERS_TABLE_SQL: str = """
 CREATE TABLE IF NOT EXISTS live_workers (
-    worker_id INTEGER PRIMARY KEY,
+    worker_id TEXT PRIMARY KEY, -- BUGFIX: Changed to TEXT to support "POOL-ID" format
     pool TEXT NOT NULL,
     problem_id TEXT,
     stage TEXT,
@@ -106,7 +99,6 @@ CREATE TABLE IF NOT EXISTS dynamic_config (
     last_updated TEXT NOT NULL
 );
 """
-
 # -- workspace.db Schema --
 CREATE_WORKSPACE_TABLE_SQL: str = """
 CREATE TABLE IF NOT EXISTS problem_data_cache (
@@ -128,10 +120,8 @@ CREATE TABLE IF NOT EXISTS problem_data_cache (
 def populate_problems_table(cursor: sqlite3.Cursor) -> bool:
     """
     Fetches all problems from the Codeforces API and inserts them into progress.db.
-
     Args:
         cursor: The database cursor for progress.db.
-
     Returns:
         True if successful, False otherwise.
     """
@@ -143,11 +133,9 @@ def populate_problems_table(cursor: sqlite3.Cursor) -> bool:
     except requests.exceptions.RequestException as e:
         logging.critical(f"Failed to fetch data from Codeforces API: {e}")
         return False
-
     if data.get('status') != 'OK':
         logging.critical(f"API returned non-OK status: {data.get('comment')}")
         return False
-
     problems = data['result']['problems']
     problems_to_insert = []
     for p in problems:
@@ -156,7 +144,6 @@ def populate_problems_table(cursor: sqlite3.Cursor) -> bool:
         tags = ", ".join(p.get('tags', []))
         timestamp = datetime.now().isoformat()
         problems_to_insert.append((problem_id, p['contestId'], p['index'], p['name'], p['rating'], tags, timestamp))
-
     try:
         cursor.executemany(
             "INSERT INTO problems (id, contest_id, problem_index, name, rating, tags, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -170,29 +157,32 @@ def populate_problems_table(cursor: sqlite3.Cursor) -> bool:
 
 def initialize_workers_table(cursor: sqlite3.Cursor) -> None:
     """
-    Sets up the initial rows for all workers across all pools in progress.db.
-
+    (BUGFIX) Sets up the initial rows for the MAX number of possible workers
+    across all pools. This ensures the dashboard has a row for every potential
+    worker the optimizer might activate.
     Args:
         cursor: The database cursor for progress.db.
     """
-    logging.info(f"Initializing {TOTAL_WORKER_COUNT} total worker slots...")
     timestamp = datetime.now().isoformat()
     workers = []
-    worker_id_counter = 1
-
+    
+    # BUGFIX: Use a dictionary of MAX worker counts to initialize the table
     pools = {
-        'INGESTION': INGESTION_WORKER_COUNT,
-        'ANALYSIS': ANALYSIS_WORKER_COUNT,
-        'IMPLEMENTATION': IMPLEMENTATION_WORKER_COUNT,
-        'VJS': VJS_WORKER_COUNT,
-        'DATA_ASSEMBLY': DATA_ASSEMBLY_WORKER_COUNT
+        'INGESTION': MAX_INGESTION_WORKERS,
+        'ANALYSIS': MAX_ANALYSIS_WORKERS,
+        'IMPLEMENTATION': MAX_IMPLEMENTATION_WORKERS,
+        'VJS': MAX_VJS_WORKERS,
+        'DATA_ASSEMBLY': MAX_DATA_ASSEMBLY_WORKERS
     }
+    total_slots = sum(pools.values())
+    logging.info(f"Initializing {total_slots} total worker slots in database...")
 
-    for pool_name, count in pools.items():
-        for _ in range(count):
-            workers.append((worker_id_counter, pool_name, 'idle', timestamp))
-            worker_id_counter += 1
-
+    for pool_name, max_count in pools.items():
+        for i in range(1, max_count + 1):
+            # Create a unique ID like "ANALYSIS-1", "ANALYSIS-2"
+            worker_id = f"{pool_name}-{i}"
+            workers.append((worker_id, pool_name, 'idle', timestamp))
+            
     try:
         cursor.executemany("INSERT OR REPLACE INTO live_workers (worker_id, pool, status, last_heartbeat) VALUES (?, ?, ?, ?)", workers)
         logging.info("Worker slots initialized successfully.")
@@ -202,21 +192,19 @@ def initialize_workers_table(cursor: sqlite3.Cursor) -> None:
 def populate_initial_dynamic_config(cursor: sqlite3.Cursor) -> None:
     """
     Sets the default values for the dynamic_config table in progress.db.
-
     Args:
         cursor: The database cursor for progress.db.
     """
     logging.info("Populating dynamic_config with default values...")
     timestamp = datetime.now().isoformat()
-
     default_configs = [
         ('ingestion_worker_count', str(DEFAULT_INGESTION_WORKER_COUNT), timestamp),
         ('analysis_worker_count', str(DEFAULT_ANALYSIS_WORKER_COUNT), timestamp),
         ('implementation_worker_count', str(DEFAULT_IMPLEMENTATION_WORKER_COUNT), timestamp),
         ('vjs_worker_count', str(DEFAULT_VJS_WORKER_COUNT), timestamp),
+        ('data_assembly_worker_count', str(DEFAULT_DATA_ASSEMBLY_WORKER_COUNT), timestamp),
         ('analysis_batch_size', str(DEFAULT_ANALYSIS_BATCH_SIZE), timestamp),
     ]
-
     try:
         cursor.executemany(
             "INSERT OR REPLACE INTO dynamic_config (key, value, last_updated) VALUES (?, ?, ?)",
@@ -241,7 +229,6 @@ def main() -> None:
             except OSError as e:
                 logging.critical(f"Error removing existing database: {e}")
                 return
-
     # Setup progress.db
     try:
         logging.info(f"Setting up '{PROGRESS_DB_NAME}'...")
@@ -254,7 +241,6 @@ def main() -> None:
             cursor.execute(CREATE_PROCESS_HISTORY_TABLE_SQL)
             cursor.execute(CREATE_METRICS_TABLE_SQL)
             cursor.execute(CREATE_DYNAMIC_CONFIG_TABLE_SQL)
-
             if populate_problems_table(cursor):
                 initialize_workers_table(cursor)
                 populate_initial_dynamic_config(cursor)
@@ -264,7 +250,6 @@ def main() -> None:
     except Exception as e:
         logging.critical(f"A critical error occurred with {PROGRESS_DB_NAME}: {e}")
         return
-
     # Setup workspace.db
     try:
         logging.info(f"Setting up '{WORKSPACE_DB_PATH}'...")

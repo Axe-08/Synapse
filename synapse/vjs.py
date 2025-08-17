@@ -1,10 +1,8 @@
 # synapse/vjs.py
 """
 Verification & Judging Subsystem (VJS) and Code Quality Analysis.
-
 This module provides the core functionality for verifying the correctness of
 AI-generated code and analyzing its quality.
-
 -   `run_vjs`: Creates a secure Docker sandbox to compile and run C++ code
     against a set of pretests, enforcing time and memory limits.
 -   `run_static_analysis`: Uses `cppcheck` to find potential bugs, style
@@ -16,39 +14,39 @@ import docker
 import os
 import shutil
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 import math
 import lizard
-
 from config import VJS_COMPILATION_TIMEOUT
-
 try:
     client = docker.from_env()
 except docker.errors.DockerException:
     logging.error("Docker is not running or accessible. The VJS will not function.")
     client = None
 
-def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int, memory_limit_kb: int) -> Dict[str, Any]:
+# EXPERIMENT: Added an optional `suffix` parameter to create unique directories
+# for benchmarking the reference code vs. the reconstructed code.
+def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int, memory_limit_kb: int, suffix: str = "") -> Dict[str, Any]:
     """
     Compiles and runs C++ code in a Docker sandbox against pretests.
-
     Args:
         problem_id: The ID of the problem being tested.
         code: The C++ source code to test.
         pretests: A list of {'input': str, 'output': str} dictionaries.
         time_limit_ms: The time limit in milliseconds.
         memory_limit_kb: The memory limit in kilobytes.
-
+        suffix: A string to append to the temp directory to avoid conflicts.
     Returns:
         A dictionary with the outcome ('SUCCESS', 'COMPILE_ERROR', etc.) and a report.
     """
     if not client:
         return {'status': 'VJS_ERROR', 'report': 'Docker client not available.'}
-
-    host_dir = os.path.join(os.getcwd(), "temp_vjs", problem_id)
+    
+    dir_name = f"{problem_id}{suffix}"
+    host_dir = os.path.join(os.getcwd(), "temp_vjs", dir_name)
     os.makedirs(host_dir, exist_ok=True)
     container = None
     try:
@@ -57,47 +55,61 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
         for i, test in enumerate(pretests):
             with open(os.path.join(host_dir, f"{i+1}.in"), "w", encoding="utf-8") as f:
                 f.write(test['input'])
-
         # Compile
         compile_cmd = "g++ main.cpp -o main -O2 -std=c++17 -static"
         container = client.containers.run("synapse-judge", command=compile_cmd, volumes={host_dir: {'bind': '/app', 'mode': 'rw'}}, working_dir="/app", detach=True)
         result = container.wait(timeout=VJS_COMPILATION_TIMEOUT)
         if result['StatusCode'] != 0:
             logs = container.logs(stderr=True, stdout=False).decode('utf-8', 'ignore')
-            return {'status': 'COMPILE_ERROR', 'report': logs[:1000]}
+            return {'status': 'COMPILE_ERROR', 'report': logs[:2000]}
         container.remove()
         container = None
 
-        # Run against pretests
+        total_execution_time_ms = 0
         for i, test in enumerate(pretests):
-            timeout_sec = (time_limit_ms / 1000.0) + 1.0
-            run_cmd = f"/usr/bin/timeout {timeout_sec}s ./main"
+            # The problem's time limit + a generous buffer for local execution.
+            timeout_sec = (time_limit_ms / 1000.0) + 2.0
+            
+            # CALIBRATION: Use /usr/bin/time to measure execution time.
+            # The format string "%e" outputs the elapsed real (wall-clock) time in seconds.
+            # We wrap the command in `sh -c` to handle the I/O redirection correctly.
+            run_cmd = f"/usr/bin/time -f \"%e\" /usr/bin/timeout {timeout_sec}s ./main"
             
             with open(os.path.join(host_dir, f"{i+1}.in"), "rb") as stdin_file:
-                container = client.containers.run("synapse-judge", command=run_cmd, stdin_open=True, volumes={host_dir: {'bind': '/app', 'mode': 'ro'}}, working_dir="/app", mem_limit=f"{memory_limit_kb}k", detach=True)
+                container = client.containers.run("synapse-judge", command=["/bin/sh", "-c", run_cmd], stdin_open=True, volumes={host_dir: {'bind': '/app', 'mode': 'ro'}}, working_dir="/app", mem_limit=f"{memory_limit_kb}k", detach=True)
                 
-                # Stream input to the container
                 s = container.attach_socket()
                 os.write(s.fileno(), stdin_file.read())
                 s.close()
-
                 result = container.wait()
 
-                if result['StatusCode'] == 124: # Timeout exit code
+                # The `time` utility outputs its measurement to stderr.
+                time_output = container.logs(stderr=True, stdout=False).decode('utf-8', 'ignore').strip()
+                
+                if result['StatusCode'] == 124:
                     return {'status': 'TIME_LIMIT_EXCEEDED', 'report': f'Time limit exceeded on test {i+1}'}
                 elif result['StatusCode'] != 0:
                     return {'status': 'RUNTIME_ERROR', 'report': f'Runtime error on test {i+1} with exit code {result["StatusCode"]}'}
+                
+                try:
+                    # The last line of stderr should be our time measurement.
+                    elapsed_sec = float(time_output.splitlines()[-1])
+                    total_execution_time_ms += int(elapsed_sec * 1000)
+                except (ValueError, IndexError):
+                    logging.warning(f"Could not parse execution time for {problem_id} test {i+1}")
 
                 actual_output = container.logs(stdout=True, stderr=False).decode('utf-8', 'ignore').strip().replace('\r\n', '\n')
                 expected_output = test['output'].strip().replace('\r\n', '\n')
-
+                
                 if actual_output != expected_output:
                     return {'status': 'WRONG_ANSWER', 'report': f'Wrong answer on test {i+1}', 'details': {
                             'test_case': i + 1, 'input': test['input'],
                             'expected_output': expected_output, 'actual_output': actual_output }}
                 container.remove()
                 container = None
-        return {'status': 'SUCCESS', 'report': f'All {len(pretests)} tests passed'}
+
+        # CALIBRATION: Return the total execution time on success.
+        return {'status': 'SUCCESS', 'report': f'All {len(pretests)} tests passed', 'execution_time_ms': total_execution_time_ms}
     except Exception as e:
         return {'status': 'VJS_ERROR', 'report': f'An unexpected VJS error occurred: {e}'}
     finally:
@@ -106,7 +118,6 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
             except docker.errors.APIError: pass
         if os.path.exists(host_dir):
             shutil.rmtree(host_dir)
-
 def run_static_analysis(code: str) -> Dict[str, Any]:
     """Runs cppcheck for static analysis on a C++ code string."""
     with tempfile.NamedTemporaryFile(mode='w+', suffix='.cpp', delete=False) as temp_f:

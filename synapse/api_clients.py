@@ -22,7 +22,7 @@ from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 # --- Model Configuration ---
 GEMINI_MODEL_NAME: str = 'gemini-2.5-pro' # Updated to latest stable model
-GROQ_MODEL_NAME: str = "llama3-8b-8192"
+GROQ_MODEL_NAME: str = "llama-3.3-70b-versatile"
 
 # --- Prompt Engineering ---
 GEMINI_ANALYST_BATCH_PROMPT: str = """
@@ -65,6 +65,22 @@ This section contains feedback from the automated judge on your last attempt. Ig
 
 **C++ SOLUTION:**
 """
+def _sanitize_cpp_code(raw_output: str) -> str:
+    """
+    Strips Markdown code blocks and any surrounding text from the LLM output.
+    This provides a robust defense against the model's tendency to add formatting.
+    """
+    # Remove the starting ```cpp or ```
+    if raw_output.startswith("```cpp\n"):
+        raw_output = raw_output[6:]
+    elif raw_output.startswith("```\n"):
+        raw_output = raw_output[4:]
+    
+    # Remove the ending ```
+    if raw_output.endswith("\n```"):
+        raw_output = raw_output[:-4]
+
+    return raw_output.strip()
 
 def call_gemini_analyst_batch(batch_data: List[Dict[str, Any]], key_manager: KeyManager) -> Dict[str, str]:
     """
@@ -179,7 +195,8 @@ def call_groq_implementer(problem_html: str, pseudocode: str, vjs_report: str, k
         duration_ms = int((time.perf_counter() - start_time) * 1000)
         db.log_metric('IMPLEMENTATION', 'api_call', duration_ms, True, {'service': 'groq', 'tokens_used': tokens_used})
 
-        return chat_completion.choices[0].message.content.strip()
+        raw_code = chat_completion.choices[0].message.content
+        return _sanitize_cpp_code(raw_code)
 
     except RateLimitError as e:
         if managed_key:
