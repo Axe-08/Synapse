@@ -19,6 +19,7 @@ from config import (
     DEFAULT_VJS_WORKER_COUNT,
     DEFAULT_DATA_ASSEMBLY_WORKER_COUNT,
     DEFAULT_ANALYSIS_BATCH_SIZE,
+    DEFAULT_SCRAPER_DELAY_SECONDS, # BUGFIX: Added import
     PROGRESS_DB_NAME,
     WORKSPACE_DB_PATH,
     API_URL,
@@ -135,9 +136,11 @@ def populate_problems_table(cursor: sqlite3.Cursor) -> bool:
     except requests.exceptions.RequestException as e:
         logging.critical(f"Failed to fetch data from Codeforces API: {e}")
         return False
+
     if data.get('status') != 'OK':
         logging.critical(f"API returned non-OK status: {data.get('comment')}")
         return False
+
     problems = data['result']['problems']
     problems_to_insert = []
     for p in problems:
@@ -146,6 +149,7 @@ def populate_problems_table(cursor: sqlite3.Cursor) -> bool:
         tags = ", ".join(p.get('tags', []))
         timestamp = datetime.now().isoformat()
         problems_to_insert.append((problem_id, p['contestId'], p['index'], p['name'], p['rating'], tags, timestamp))
+
     try:
         cursor.executemany(
             "INSERT INTO problems (id, contest_id, problem_index, name, rating, tags, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -206,7 +210,7 @@ def populate_initial_dynamic_config(cursor: sqlite3.Cursor) -> None:
         ('vjs_worker_count', str(DEFAULT_VJS_WORKER_COUNT), timestamp),
         ('data_assembly_worker_count', str(DEFAULT_DATA_ASSEMBLY_WORKER_COUNT), timestamp),
         ('analysis_batch_size', str(DEFAULT_ANALYSIS_BATCH_SIZE), timestamp),
-        ('scraper_delay_seconds', str(config.DEFAULT_SCRAPER_DELAY_SECONDS), timestamp),
+        ('scraper_delay_seconds', str(DEFAULT_SCRAPER_DELAY_SECONDS), timestamp), # BUGFIX: Correctly reference variable
     ]
     try:
         cursor.executemany(
@@ -232,6 +236,7 @@ def main() -> None:
             except OSError as e:
                 logging.critical(f"Error removing existing database: {e}")
                 return
+
     # Setup progress.db
     try:
         logging.info(f"Setting up '{PROGRESS_DB_NAME}'...")
@@ -253,6 +258,7 @@ def main() -> None:
     except Exception as e:
         logging.critical(f"A critical error occurred with {PROGRESS_DB_NAME}: {e}")
         return
+
     # Setup workspace.db
     try:
         logging.info(f"Setting up '{WORKSPACE_DB_PATH}'...")

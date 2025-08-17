@@ -18,11 +18,13 @@ from datetime import datetime
 from typing import Dict, Any, List
 from synapse.database_writer import db_writer
 from dotenv import load_dotenv
+
 # --- Project Imports ---
 import synapse.database as db
 from synapse.key_manager import KeyManager
 from synapse.workers import (
     ingestion_worker,
+    calibration_worker, # FEATURE: Added calibration worker
     analysis_worker,
     implementation_worker,
     vjs_worker,
@@ -32,16 +34,21 @@ from synapse.scraper import get_authenticated_driver
 from create_database import (
     CREATE_PROBLEMS_TABLE_SQL, CREATE_WORKERS_TABLE_SQL,
     CREATE_PROCESS_HISTORY_TABLE_SQL, CREATE_WORKSPACE_TABLE_SQL,
-    # BUGFIX: Import the missing CREATE_METRICS_TABLE_SQL
-    CREATE_METRICS_TABLE_SQL
+    # BUGFIX: Import the missing CREATE statements
+    CREATE_METRICS_TABLE_SQL,
+    CREATE_DYNAMIC_CONFIG_TABLE_SQL,
+    CREATE_KEY_STATUS_TABLE_SQL
 )
+import config as default_config
+
 # --- Configuration ---
 DEBUG_PROBLEM_IDS: List[str] = ["1003A", "1003C", "1003D"]
-MAX_ITERATIONS: int = 15 # Safety break to prevent infinite loops
+MAX_ITERATIONS: int = 20 # Safety break to prevent infinite loops
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s')
 load_dotenv()
 GEMINI_API_KEYS: List[str] = [k.strip() for k in os.getenv('GEMINI_API_KEYS', '').split(',') if k.strip()]
 GROQ_API_KEYS: List[str] = [k.strip() for k in os.getenv('GROQ_API_KEYS', '').split(',') if k.strip()]
+
 def print_header(title: str) -> None:
     """Prints a formatted header to the console."""
     print("\n" + "="*80)
@@ -80,6 +87,7 @@ def main() -> None:
     if not all([GEMINI_API_KEYS, GROQ_API_KEYS]):
         logging.error("API keys not found in .env file. Exiting.")
         return
+
     # --- SETUP ---
     print_header(f"SETUP: PREPARING DEBUG RUN FOR {len(DEBUG_PROBLEM_IDS)} PROBLEMS")
     
@@ -94,18 +102,34 @@ def main() -> None:
     db_writer.set_db_path(debug_progress_db)
     
     with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
-        # BUGFIX: Add the missing CREATE_METRICS_TABLE_SQL
+        # BUGFIX: Add the missing CREATE statements
         conn.execute(CREATE_PROBLEMS_TABLE_SQL)
         conn.execute(CREATE_WORKERS_TABLE_SQL)
         conn.execute(CREATE_PROCESS_HISTORY_TABLE_SQL)
-        conn.execute(CREATE_METRICS_TABLE_SQL) # <-- THE FIX
+        conn.execute(CREATE_METRICS_TABLE_SQL)
+        conn.execute(CREATE_DYNAMIC_CONFIG_TABLE_SQL)
+        conn.execute(CREATE_KEY_STATUS_TABLE_SQL)
+
         for pid in DEBUG_PROBLEM_IDS:
             conn.execute("INSERT INTO problems (id, name, contest_id, problem_index, last_updated, status) VALUES (?, ?, ?, ?, ?, ?)",
                          (pid, 'Debug', pid[:-1], pid[-1], time.time(), 'pending_ingestion'))
         for i in range(1, 6):
             conn.execute("INSERT INTO live_workers (worker_id, pool, status, last_heartbeat) VALUES (?, ?, ?, ?)",
                          (f'DEBUG-{i}', 'DEBUG', 'idle', datetime.now().isoformat()))
-                         
+        
+        # FEATURE: Populate dynamic config so scraper can read delay value
+        timestamp = datetime.now().isoformat()
+        default_configs = [
+            ('scraper_delay_seconds', str(default_config.DEFAULT_SCRAPER_DELAY_SECONDS), timestamp),
+            ('ingestion_worker_count', str(default_config.DEFAULT_INGESTION_WORKER_COUNT), timestamp),
+            ('analysis_worker_count', str(default_config.DEFAULT_ANALYSIS_WORKER_COUNT), timestamp),
+            ('implementation_worker_count', str(default_config.DEFAULT_IMPLEMENTATION_WORKER_COUNT), timestamp),
+            ('vjs_worker_count', str(default_config.DEFAULT_VJS_WORKER_COUNT), timestamp),
+            ('data_assembly_worker_count', str(default_config.DEFAULT_DATA_ASSEMBLY_WORKER_COUNT), timestamp),
+            ('analysis_batch_size', str(default_config.DEFAULT_ANALYSIS_BATCH_SIZE), timestamp),
+        ]
+        conn.executemany("INSERT OR REPLACE INTO dynamic_config (key, value, last_updated) VALUES (?, ?, ?)", default_configs)
+                        
     with db._get_db_connection(db.WORKSPACE_DB_PATH) as conn:
         conn.execute(CREATE_WORKSPACE_TABLE_SQL)
 
@@ -132,12 +156,23 @@ def main() -> None:
             statuses = get_all_problem_statuses()
             print_header(f"ITERATION {iteration} | CURRENT STATUSES")
             print(json.dumps(statuses, indent=2))
+            
             # Check for completion
-            terminal_states = {'completed', 'quarantined'} | {f'failed_{s}' for s in ['ingestion', 'analysis', 'implementation', 'vjs', 'data_assembly']}
+            terminal_states = {'completed', 'quarantined'} | {f'failed_{s}' for s in ['ingestion', 'calibration', 'analysis', 'implementation', 'vjs', 'data_assembly']}
             if all(s in terminal_states for s in statuses.values()):
                 logging.info("All problems have reached a terminal state. Ending debug run.")
                 break
+
             # --- Dispatch jobs based on current status ---
+            
+            # --- STAGE 2: CALIBRATION (Single-job worker) ---
+            for pid, status in statuses.items():
+                if status == 'pending_calibration':
+                    job = {'id': pid, 'rating': 0}
+                    print_header(f"Dispatching '{pid}' to CALIBRATION worker")
+                    calibration_worker(job, 'CALIBRATION-1')
+
+            # --- STAGE 3: ANALYSIS (Batched worker) ---
             analysis_jobs = [{'id': pid} for pid, s in statuses.items() if s == 'pending_analysis']
             if analysis_jobs:
                 print_header(f"Dispatching {len(analysis_jobs)} jobs to ANALYSIS worker")
@@ -146,6 +181,7 @@ def main() -> None:
                 for job in analysis_jobs:
                     print_workspace_details(job['id'], ['arl_pseudocode'])
 
+            # --- STAGES 4-7: OTHER SINGLE-JOB WORKERS ---
             for pid, status in statuses.items():
                 job = {'id': pid, 'rating': 0}
                 if status == 'pending_implementation':
