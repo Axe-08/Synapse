@@ -23,7 +23,7 @@ from datetime import datetime
 import logging
 import json
 from typing import List, Dict, Any, Optional
-
+import time
 from synapse.database_writer import db_writer
 
 PROGRESS_DB_PATH: str = 'progress.db'
@@ -92,34 +92,45 @@ def get_next_jobs(status: str, limit: int) -> List[Dict[str, Any]]:
     orchestrator threads trying to claim the same jobs.
     """
     new_status = f"in_progress_{status.split('_')[-1]}"
-    with _get_db_connection(PROGRESS_DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("BEGIN;")
+    max_retries=5
+    for attempt in range(max_retries):
         try:
-            cursor.execute(
-                "SELECT id, rating FROM problems WHERE status = ? ORDER BY rating ASC, id ASC LIMIT ?",
-                (status, limit)
-            )
-            rows = cursor.fetchall()
-            if not rows:
-                conn.commit()
+            with _get_db_connection(PROGRESS_DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN;")
+                try:
+                    cursor.execute(
+                        "SELECT id, rating FROM problems WHERE status = ? ORDER BY rating ASC, id ASC LIMIT ?",
+                        (status, limit)
+                    )
+                    rows = cursor.fetchall()
+                    if not rows:
+                        conn.commit()
+                        return []
+
+                    problem_ids = [row[0] for row in rows]
+                    jobs_to_process = [{'id': row[0], 'rating': row[1]} for row in rows]
+
+                    timestamp = datetime.now().isoformat()
+                    placeholders = ','.join('?' for _ in problem_ids)
+                    update_query = f"UPDATE problems SET status = ?, last_updated = ? WHERE id IN ({placeholders})"
+                    cursor.execute(update_query, (new_status, timestamp, *problem_ids))
+
+                    conn.commit()
+                    logging.info(f"Locked {len(jobs_to_process)} problems for stage '{status}'.")
+                    return jobs_to_process
+                except sqlite3.Error as e:
+                    conn.rollback()
+                    logging.error(f"Failed to get next jobs atomically: {e}", exc_info=True)
+                    return []
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                logging.warning(f"Database is locked, attempt {attempt + 1}/{max_retries}. Retrying in 0.5s...")
+                time.sleep(0.5) # Wait and retry
+                continue
+            else:
+                logging.error(f"Failed to get next jobs after retries: {e}", exc_info=True)
                 return []
-
-            problem_ids = [row[0] for row in rows]
-            jobs_to_process = [{'id': row[0], 'rating': row[1]} for row in rows]
-
-            timestamp = datetime.now().isoformat()
-            placeholders = ','.join('?' for _ in problem_ids)
-            update_query = f"UPDATE problems SET status = ?, last_updated = ? WHERE id IN ({placeholders})"
-            cursor.execute(update_query, (new_status, timestamp, *problem_ids))
-
-            conn.commit()
-            logging.info(f"Locked {len(jobs_to_process)} problems for stage '{status}'.")
-            return jobs_to_process
-        except sqlite3.Error as e:
-            conn.rollback()
-            logging.error(f"Failed to get next jobs atomically: {e}", exc_info=True)
-            return []
 
 # --- Problem State Transition Wrappers ---
 

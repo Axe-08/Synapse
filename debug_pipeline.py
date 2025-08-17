@@ -18,7 +18,7 @@ import sqlite3
 from queue import Queue
 from datetime import datetime
 from typing import Dict, Any, List
-
+from synapse.database_writer import db_writer
 from dotenv import load_dotenv
 
 # --- Project Imports ---
@@ -70,6 +70,7 @@ def main() -> None:
 
     # --- SETUP ---
     print_header(f"SETUP: PREPARING DEBUG RUN FOR {len(DEBUG_PROBLEM_IDS)} PROBLEMS")
+    db_writer.start()
     if os.path.exists('debug.db'): os.remove('debug.db')
     if os.path.exists('debug_workspace.db'): os.remove('debug_workspace.db')
     db.PROGRESS_DB_PATH = 'debug.db'; db.WORKSPACE_DB_PATH = 'debug_workspace.db'
@@ -98,7 +99,7 @@ def main() -> None:
         print_header("STAGE 1: INITIAL INGESTION")
         for i, pid in enumerate(DEBUG_PROBLEM_IDS):
             ingestion_worker({'id': pid, 'rating': 0}, i + 1, browser_queue)
-
+        db_writer.wait_for_completion()
         # === MAIN STATE-DRIVEN LOOP ===
         while iteration < MAX_ITERATIONS:
             iteration += 1
@@ -132,7 +133,7 @@ def main() -> None:
                 elif status == 'pending_rescraping':
                     print_header(f"Dispatching '{pid}' to INGESTION worker for re-scraping")
                     ingestion_worker(job, 1, browser_queue)
-
+            db_writer.wait_for_completion()
             time.sleep(2) # Pause to allow observing state changes
 
         if iteration >= MAX_ITERATIONS:
@@ -145,6 +146,7 @@ def main() -> None:
         print_header("FINAL PROBLEM STATUSES")
         print(json.dumps(get_all_problem_statuses(), indent=2))
         print_header("CLEANUP")
+        db_writer.stop()
         driver_instance = browser_queue.get_nowait()
         if driver_instance: driver_instance.quit()
         if os.path.exists('debug.db'): os.remove('debug.db')

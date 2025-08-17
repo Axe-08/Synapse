@@ -85,7 +85,7 @@ def main(args: argparse.Namespace) -> None:
     """
     db.reset_all_workers_to_idle()
     db_writer.start()
-
+    time.sleep(1)
     # Initialize shared resources
     # NOTE: We control throughput via batch sizes and worker counts read
     # from the dynamic config, which can be changed by the optimizer.

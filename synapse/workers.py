@@ -27,7 +27,7 @@ from synapse.vjs import run_vjs, run_static_analysis, run_semantic_analysis
 from synapse.data_assembly import _assemble_golden_record, _parse_memory_limit, _parse_time_limit
 from synapse.data_manager import append_to_dataset
 from config import MAX_ANALYSIS_RETRIES, MAX_IMPLEMENTATION_RETRIES, MAX_RESCRAPING_ATTEMPTS
-
+MAX_BROWSER_USES=25
 # --- STAGE 1: INGESTION & RE-SCRAPING ---
 def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Queue):
     """
@@ -44,6 +44,8 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Que
     driver = None
     start_time = time.perf_counter()
     is_rescraping = False
+    db.update_worker_status(worker_id, 'INGESTION', problem_id, 'PROCESSING', 'active')
+
     try:
         # Check current state to see if this is a re-scrape job
         with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
@@ -55,15 +57,15 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Que
             exclude_ids = tried_ids_str.split(',') if tried_ids_str else []
 
         # Acquire a browser instance
-        db.update_worker_status(worker_id, 'INGESTION', problem_id, 'GET_BROWSER', 'active')
+        # db.update_worker_status(worker_id, 'INGESTION', problem_id, 'GET_BROWSER', 'active')
         driver = browser_queue.get(timeout=300) # Long timeout to wait for a browser
         if driver is None:
-            db.update_worker_status(worker_id, 'INGESTION', problem_id, 'INITIALIZING', 'active')
+            # db.update_worker_status(worker_id, 'INGESTION', problem_id, 'INITIALIZING', 'active')
             driver = get_authenticated_driver()
             if not driver: raise Exception("Failed to initialize a new browser session.")
 
         # Perform the scrape
-        db.update_worker_status(worker_id, 'INGESTION', problem_id, 'SCRAPING', 'active')
+        # db.update_worker_status(worker_id, 'INGESTION', problem_id, 'SCRAPING', 'active')
         scraped_data = fetch_problem_data(problem_id, driver, exclude_submission_ids=exclude_ids)
 
         if not scraped_data:
@@ -73,7 +75,7 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Que
             raise Exception(reason)
 
         # Save data and transition state
-        db.update_worker_status(worker_id, 'INGESTION', problem_id, 'SAVING', 'active')
+        # db.update_worker_status(worker_id, 'INGESTION', problem_id, 'SAVING', 'active')
         db.save_ingestion_data_to_workspace(
             problem_id=problem_id,
             html=scraped_data['page_details']['problem_statement_html'],
@@ -106,7 +108,21 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Que
             
     finally:
         if 'driver' in locals() and driver is not None:
-             browser_queue.put(driver)
+            if not hasattr(driver, 'uses_count'):
+                driver.uses_count =0
+            driver.uses_count += 1
+            if driver.uses_count >= MAX_BROWSER_USES:
+                logging.warning(f"Retiring browser instance after {driver.uses_count} uses to maintain stability.")
+                try:
+                    driver.quit()
+                except Exception as e:
+                    logging.error(f"Error while quitting retired browser: {e}")
+                # Signal for a new driver to be created on the next run
+                browser_queue.put(None)
+            else:
+                # Return the still-healthy driver to the queue
+                browser_queue.put(driver)
+
         db.update_worker_status(worker_id, 'INGESTION', None, None, 'idle')
 
 

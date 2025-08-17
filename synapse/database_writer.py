@@ -56,7 +56,9 @@ class DatabaseWriter:
                 # Consider adding logic to rollback or handle the error
             except Exception as e:
                 logging.error(f"An unexpected error occurred in the DB writer thread: {e}")
-
+            finally:
+                if item is not SENTINEL:
+                    self._queue.task_done()
         conn.close()
         logging.info("Database writer thread stopped.")
 
@@ -84,6 +86,15 @@ class DatabaseWriter:
             if self._thread.is_alive():
                 logging.warning("Database writer thread did not stop in time.")
             self._thread = None
+    def wait_for_completion(self) -> None: # <--- ADD THIS ENTIRE NEW METHOD
+        """
+        Blocks until the queue of pending write operations is empty.
+        This is essential for scripts that need to ensure writes are
+        persisted before performing a critical read.
+        """
+        logging.info("Waiting for database writer to flush queue...")
+        self._queue.join()
+        logging.info("Database writer queue flushed.")
 
 # Create a single, global instance to be used by the entire application
 db_writer = DatabaseWriter(PROGRESS_DB_NAME)

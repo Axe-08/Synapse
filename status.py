@@ -22,7 +22,7 @@ from rich.live import Live
 from rich.layout import Layout
 from rich.align import Align
 from rich.columns import Columns
-from rich.sparkline import Sparkline
+from rich.text import Text
 from datetime import datetime, timedelta
 import time
 import os
@@ -39,32 +39,59 @@ vjs_queue_history: Deque[int] = deque(maxlen=MAX_DATAPOINTS)
 analysis_success_history: Deque[float] = deque(maxlen=MAX_DATAPOINTS)
 ingestion_success_history: Deque[float] = deque(maxlen=MAX_DATAPOINTS)
 
-def get_db_data() -> Optional[Tuple[Dict, List, List]]:
+# --- Minimal Sparkline replacement for Rich 14+ ---
+def mini_sparkline(data: Deque[float] | List[float], label: str = "") -> Text:
+    """
+    Render a tiny unicode sparkline as a Rich Text object.
+    Uses block characters: ▁▂▃▄▅▆▇█
+    """
+    blocks = "▁▂▃▄▅▆▇█"
+    # Convert deque to list once
+    seq = list(data)
+    if not seq:
+        return Text(f"{label}: (no data)")
+    mn, mx = min(seq), max(seq)
+    if mx == mn:
+        # Flat line
+        return Text(f"{label}: " + (blocks[0] * len(seq)))
+    # Scale each point into 0..7
+    scale = len(blocks) - 1
+    parts = []
+    rng = mx - mn
+    for x in seq:
+        idx = int((x - mn) / rng * scale)
+        parts.append(blocks[idx])
+    return Text(f"{label}: {''.join(parts)}")
+
+def get_db_data() -> Optional[Tuple[Dict[str, int], List[Tuple[Any, ...]], List[Tuple[str, str]]]]:
     """Fetches all necessary data from the database for the dashboard."""
     try:
         with sqlite3.connect(f'file:{PROGRESS_DB_NAME}?mode=ro', uri=True) as conn:
             cursor = conn.cursor()
-            
+
             cursor.execute("SELECT status, COUNT(*) FROM problems GROUP BY status")
             summary = dict(cursor.fetchall())
-            
+
             cursor.execute("SELECT worker_id, pool, problem_id, stage, status FROM live_workers ORDER BY worker_id")
             workers = cursor.fetchall()
 
             cursor.execute("SELECT key, value FROM dynamic_config ORDER BY key")
             dynamic_config = cursor.fetchall()
-            
+
+            # Update histories
             vjs_queue_history.append(summary.get('pending_vjs', 0))
 
             since = (datetime.now() - timedelta(minutes=10)).isoformat()
             cursor.execute("SELECT worker_pool, success FROM metrics WHERE timestamp > ?", (since,))
             recent_metrics = cursor.fetchall()
-            
+
             analysis = [m[1] for m in recent_metrics if m[0] == 'ANALYSIS']
-            if analysis: analysis_success_history.append(sum(analysis) / len(analysis) * 100)
+            if analysis:
+                analysis_success_history.append(sum(analysis) / len(analysis) * 100)
 
             ingestion = [m[1] for m in recent_metrics if m[0] == 'INGESTION']
-            if ingestion: ingestion_success_history.append(sum(ingestion) / len(ingestion) * 100)
+            if ingestion:
+                ingestion_success_history.append(sum(ingestion) / len(ingestion) * 100)
 
             return summary, workers, dynamic_config
     except sqlite3.Error as e:
@@ -89,14 +116,17 @@ def generate_summary_panel(summary_data: Dict[str, int]) -> Panel:
     table = Table(show_header=False, box=None, padding=(0, 1))
     table.add_column("Status"); table.add_column("Count", justify="right")
     status_map = {
-        "pending_ingestion": "[cyan]📥 Ingestion[/cyan]", "pending_rescraping": "[cyan]🔄 Re-Scraping[/cyan]",
-        "pending_analysis": "[magenta]🧠 Analysis[/magenta]", "pending_implementation": "[yellow]⌨️ Implementation[/yellow]",
-        "pending_vjs": "[blue]⚖️ Verification[/blue]", "pending_data_assembly": "[green]📦 Assembly[/green]",
+        "pending_ingestion": "[cyan]📥 Ingestion[/cyan]",
+        "pending_rescraping": "[cyan]🔄 Re-Scraping[/cyan]",
+        "pending_analysis": "[magenta]🧠 Analysis[/magenta]",
+        "pending_implementation": "[yellow]⌨️ Implementation[/yellow]",
+        "pending_vjs": "[blue]⚖️ Verification[/blue]",
+        "pending_data_assembly": "[green]📦 Assembly[/green]",
         "completed": "[bold green]✅ Completed[/bold green]",
     }
     for status, display in status_map.items():
         table.add_row(display, f"{summary_data.get(status, 0):,}")
-    
+
     quarantined = summary_data.get('quarantined', 0)
     total = sum(summary_data.values())
     table.add_row("---", "---")
@@ -113,16 +143,16 @@ def generate_levers_panel(config_data: List[Tuple[str, str]]) -> Panel:
     return Panel(table, title="[bold yellow]Optimizer Levers[/bold yellow]", border_style="yellow")
 
 def generate_graphs_panel() -> Panel:
-    """Creates the 'Live Metrics' panel with sparklines."""
-    vjs_graph = Sparkline(vjs_queue_history, " VJS Queue")
-    analysis_graph = Sparkline(analysis_success_history, " Analysis Success %")
-    ingestion_graph = Sparkline(ingestion_success_history, " Ingestion Success %")
+    """Creates the 'Live Metrics' panel with unicode sparklines."""
+    vjs_graph = mini_sparkline(vjs_queue_history, " VJS Queue")
+    analysis_graph = mini_sparkline(analysis_success_history, " Analysis Success %")
+    ingestion_graph = mini_sparkline(ingestion_success_history, " Ingestion Success %")
     return Panel(
         Columns([vjs_graph, analysis_graph, ingestion_graph], expand=True),
         title="[bold magenta]Live Metrics (10 min)[/bold magenta]", border_style="magenta"
     )
 
-def generate_workers_panel(workers_data: List[Tuple]) -> Panel:
+def generate_workers_panel(workers_data: List[Tuple[Any, ...]]) -> Panel:
     """Creates the 'Live Worker Activity' panel."""
     table = Table(header_style="bold blue", box=None, padding=(0, 1))
     table.add_column("ID", justify="center"); table.add_column("Pool"); table.add_column("Status")
@@ -138,16 +168,19 @@ def main():
     if not os.path.exists(PROGRESS_DB_NAME):
         console.print(f"[bold red]Error:[/bold red] Database '{PROGRESS_DB_NAME}' not found.")
         return
-        
+
     layout = generate_layout()
     try:
         with Live(layout, console=console, screen=True, redirect_stderr=False) as live:
             while True:
                 db_data = get_db_data()
-                if db_data is None: break
-                
+                if db_data is None:
+                    break
+
                 summary, workers, dynamic_config = db_data
-                layout["header"].update(Align.center(f"[bold]Project Synapse Dashboard[/bold] | {datetime.now():%Y-%m-%d %H:%M:%S}"))
+                layout["header"].update(
+                    Align.center(f"[bold]Project Synapse Dashboard[/bold] | {datetime.now():%Y-%m-%d %H:%M:%S}")
+                )
                 layout["summary"].update(generate_summary_panel(summary))
                 layout["levers"].update(generate_levers_panel(dynamic_config))
                 layout["workers"].update(generate_workers_panel(workers))
