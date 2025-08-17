@@ -32,92 +32,118 @@ except docker.errors.DockerException:
 def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int, memory_limit_kb: int, suffix: str = "") -> Dict[str, Any]:
     """
     Compiles and runs C++ code in a Docker sandbox against pretests.
-    Args:
-        problem_id: The ID of the problem being tested.
-        code: The C++ source code to test.
-        pretests: A list of {'input': str, 'output': str} dictionaries.
-        time_limit_ms: The time limit in milliseconds.
-        memory_limit_kb: The memory limit in kilobytes.
-        suffix: A string to append to the temp directory to avoid conflicts.
-    Returns:
-        A dictionary with the outcome ('SUCCESS', 'COMPILE_ERROR', etc.) and a report.
+    (V3 - Enhanced with verbose logging)
     """
     if not client:
         return {'status': 'VJS_ERROR', 'report': 'Docker client not available.'}
     
+    # --- NEW: Verbose Logging ---
+    logging.info(f"--- VJS START: Problem {problem_id}{suffix} ---")
+    
     dir_name = f"{problem_id}{suffix}"
     host_dir = os.path.join(os.getcwd(), "temp_vjs", dir_name)
     os.makedirs(host_dir, exist_ok=True)
-    container = None
+    
     try:
-        with open(os.path.join(host_dir, "main.cpp"), "w", encoding="utf-8") as f:
+        # --- STAGE 1: Compilation ---
+        logging.info(f"[{problem_id}] Stage 1: Compiling source code...")
+        source_path = os.path.join(host_dir, "main.cpp")
+        with open(source_path, "w", encoding="utf-8") as f:
             f.write(code)
-        for i, test in enumerate(pretests):
-            with open(os.path.join(host_dir, f"{i+1}.in"), "w", encoding="utf-8") as f:
-                f.write(test['input'])
-        # Compile
-        compile_cmd = "g++ main.cpp -o main -O2 -std=c++17 -static"
-        container = client.containers.run("synapse-judge", command=compile_cmd, volumes={host_dir: {'bind': '/app', 'mode': 'rw'}}, working_dir="/app", detach=True)
-        result = container.wait(timeout=VJS_COMPILATION_TIMEOUT)
-        if result['StatusCode'] != 0:
-            logs = container.logs(stderr=True, stdout=False).decode('utf-8', 'ignore')
-            return {'status': 'COMPILE_ERROR', 'report': logs[:2000]}
-        container.remove()
-        container = None
 
+        abs_host_dir = os.path.abspath(host_dir)
+        
+        compile_cmd = [
+            "docker", "run", "--rm",
+            "-v", f"{abs_host_dir}:/app",
+            "-w", "/app",
+            "synapse-judge",
+            "g++", "main.cpp", "-o", "main", "-O2", "-std=c++20", "-static"
+        ]
+
+        compile_proc = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=VJS_COMPILATION_TIMEOUT)
+
+        if compile_proc.returncode != 0:
+            logging.error(f"[{problem_id}] Compilation FAILED. Exit code: {compile_proc.returncode}")
+            return {'status': 'COMPILE_ERROR', 'report': compile_proc.stderr[:2000]}
+        
+        logging.info(f"[{problem_id}] Compilation SUCCEEDED.")
+
+        # --- STAGE 2: Execution per Test Case ---
+        logging.info(f"[{problem_id}] Stage 2: Executing {len(pretests)} test cases...")
         total_execution_time_ms = 0
         for i, test in enumerate(pretests):
-            # The problem's time limit + a generous buffer for local execution.
+            test_num_str = f"Test {i+1}/{len(pretests)}"
+            logging.info(f"[{problem_id}] Running {test_num_str}...")
+
             timeout_sec = (time_limit_ms / 1000.0) + 2.0
             
-            # CALIBRATION: Use /usr/bin/time to measure execution time.
-            # The format string "%e" outputs the elapsed real (wall-clock) time in seconds.
-            # We wrap the command in `sh -c` to handle the I/O redirection correctly.
-            run_cmd = f"/usr/bin/time -f \"%e\" /usr/bin/timeout {timeout_sec}s ./main"
+            run_cmd_inside_container = f"/usr/bin/time -f \"%e\" ./main"
             
-            with open(os.path.join(host_dir, f"{i+1}.in"), "rb") as stdin_file:
-                container = client.containers.run("synapse-judge", command=["/bin/sh", "-c", run_cmd], stdin_open=True, volumes={host_dir: {'bind': '/app', 'mode': 'ro'}}, working_dir="/app", mem_limit=f"{memory_limit_kb}k", detach=True)
-                
-                s = container.attach_socket()
-                os.write(s.fileno(), stdin_file.read())
-                s.close()
-                result = container.wait()
+            docker_run_cmd = [
+                "docker", "run", "--rm", "-i",
+                "--memory", f"{memory_limit_kb}k",
+                "-v", f"{abs_host_dir}:/app:ro",
+                "-w", "/app",
+                "synapse-judge",
+                "timeout", str(timeout_sec),
+                "/bin/sh", "-c", run_cmd_inside_container
+            ]
 
-                # The `time` utility outputs its measurement to stderr.
-                time_output = container.logs(stderr=True, stdout=False).decode('utf-8', 'ignore').strip()
-                
-                if result['StatusCode'] == 124:
-                    return {'status': 'TIME_LIMIT_EXCEEDED', 'report': f'Time limit exceeded on test {i+1}'}
-                elif result['StatusCode'] != 0:
-                    return {'status': 'RUNTIME_ERROR', 'report': f'Runtime error on test {i+1} with exit code {result["StatusCode"]}'}
-                
-                try:
-                    # The last line of stderr should be our time measurement.
-                    elapsed_sec = float(time_output.splitlines()[-1])
-                    total_execution_time_ms += int(elapsed_sec * 1000)
-                except (ValueError, IndexError):
-                    logging.warning(f"Could not parse execution time for {problem_id} test {i+1}")
+            input_data = test['input']
+            
+            try:
+                run_proc = subprocess.run(
+                    docker_run_cmd,
+                    input=input_data,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec + 5
+                )
+            except subprocess.TimeoutExpired:
+                logging.warning(f"[{problem_id}] {test_num_str}: VJS subsystem timed out.")
+                return {'status': 'TIME_LIMIT_EXCEEDED', 'report': f'VJS subsystem timed out on test {i+1}.'}
 
-                actual_output = container.logs(stdout=True, stderr=False).decode('utf-8', 'ignore').strip().replace('\r\n', '\n')
-                expected_output = test['output'].strip().replace('\r\n', '\n')
-                
-                if actual_output != expected_output:
-                    return {'status': 'WRONG_ANSWER', 'report': f'Wrong answer on test {i+1}', 'details': {
-                            'test_case': i + 1, 'input': test['input'],
-                            'expected_output': expected_output, 'actual_output': actual_output }}
-                container.remove()
-                container = None
+            if run_proc.returncode == 124:
+                logging.warning(f"[{problem_id}] {test_num_str}: TIME_LIMIT_EXCEEDED.")
+                return {'status': 'TIME_LIMIT_EXCEEDED', 'report': f'Time limit exceeded on test {i+1}'}
+            elif run_proc.returncode != 0:
+                logging.error(f"[{problem_id}] {test_num_str}: RUNTIME_ERROR (Exit Code: {run_proc.returncode}).")
+                return {'status': 'RUNTIME_ERROR', 'report': f'Runtime error on test {i+1} with exit code {run_proc.returncode}. Stderr: {run_proc.stderr}'}
 
-        # CALIBRATION: Return the total execution time on success.
+            try:
+                time_output = run_proc.stderr.strip()
+                elapsed_sec = float(time_output.splitlines()[-1])
+                total_execution_time_ms += int(elapsed_sec * 1000)
+            except (ValueError, IndexError):
+                logging.warning(f"[{problem_id}] Could not parse execution time for {test_num_str}. Stderr: {run_proc.stderr}")
+
+            actual_output = run_proc.stdout.strip().replace('\r\n', '\n')
+            expected_output = test['output'].strip().replace('\r\n', '\n')
+
+            if actual_output != expected_output:
+                logging.warning(f"[{problem_id}] {test_num_str}: WRONG_ANSWER.")
+                # --- NEW: Log the input/output diff for immediate diagnosis ---
+                logging.warning(f"--> Input:\n{test['input']}")
+                logging.warning(f"--> Expected Output:\n{expected_output}")
+                logging.warning(f"--> Actual Output:\n{actual_output}")
+                return {'status': 'WRONG_ANSWER', 'report': f'Wrong answer on test {i+1}', 'details': {
+                    'test_case': i + 1, 'input': test['input'],
+                    'expected_output': expected_output, 'actual_output': actual_output }}
+            
+            # --- NEW: Log success for the test case ---
+            logging.info(f"[{problem_id}] {test_num_str}: PASSED.")
+        
+        logging.info(f"--- VJS SUCCESS: All {len(pretests)} tests passed for {problem_id}{suffix} ---")
         return {'status': 'SUCCESS', 'report': f'All {len(pretests)} tests passed', 'execution_time_ms': total_execution_time_ms}
+
     except Exception as e:
+        logging.critical(f"--- VJS CRITICAL ERROR: An unexpected exception occurred for {problem_id}{suffix}: {e} ---", exc_info=True)
         return {'status': 'VJS_ERROR', 'report': f'An unexpected VJS error occurred: {e}'}
     finally:
-        if container:
-            try: container.remove(force=True)
-            except docker.errors.APIError: pass
         if os.path.exists(host_dir):
             shutil.rmtree(host_dir)
+            
 def run_static_analysis(code: str) -> Dict[str, Any]:
     """Runs cppcheck for static analysis on a C++ code string."""
     with tempfile.NamedTemporaryFile(mode='w+', suffix='.cpp', delete=False) as temp_f:
