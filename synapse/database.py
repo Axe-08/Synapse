@@ -38,7 +38,7 @@ def _get_db_connection(db_path: str) -> sqlite3.Connection:
 
 # --- ASYNC WRITE Operations (Delegated to db_writer) ---
 
-def update_worker_status(worker_id: int, pool: str, problem_id: Optional[str], stage: Optional[str], status: str) -> None:
+def update_worker_status(worker_id: str, pool: str, problem_id: Optional[str], stage: Optional[str], status: str) -> None:
     """(Async) Updates the live status of a single worker in the `live_workers` table."""
     timestamp = datetime.now().isoformat()
     sql = "UPDATE live_workers SET problem_id = ?, stage = ?, status = ?, last_heartbeat = ? WHERE worker_id = ? AND pool = ?"
@@ -173,15 +173,16 @@ def transition_to_pending_calibration(problem_id: str):
     save_process_history(problem_id, 'INGESTION', 'SUCCESS', 'Data ingested. Ready for calibration.')
 
 # --- ADD THIS NEW WORKSPACE SAVE FUNCTION ---
-def save_calibration_results(problem_id: str, validated_pretests: List[Dict], slowness_factor: float):
+def save_calibration_results(problem_id: str, validated_pretests: List[Dict], slowness_factor: float, checker_mode: str):
     """Saves the output of a successful calibration stage to the workspace."""
     with _get_db_connection(WORKSPACE_DB_PATH) as conn:
         conn.execute(
             """UPDATE problem_data_cache 
-               SET validated_pretests_json = ?, slowness_factor = ?
+               SET validated_pretests_json = ?, slowness_factor = ?, checker_mode = ?
                WHERE problem_id = ?""",
-            (json.dumps(validated_pretests), slowness_factor, problem_id)
+            (json.dumps(validated_pretests), slowness_factor, checker_mode, problem_id)
         )
+
 def transition_to_pending_rescraping(problem_id: str, failed_submission_id: str):
     """(Hybrid) Transitions a problem to re-scraping after max analysis retries."""
     current_tried_ids = ""

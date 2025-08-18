@@ -21,6 +21,7 @@ import xml.etree.ElementTree as ET
 import math
 import lizard
 from config import VJS_COMPILATION_TIMEOUT
+
 try:
     client = docker.from_env()
 except docker.errors.DockerException:
@@ -32,11 +33,18 @@ ACCEPTED = 0
 WRONG_ANSWER = 1
 PRESENTATION_ERROR = 2
 
+def _truncate_text(text: str, max_len: int = 512) -> str:
+    """Truncates text to a max length, showing the start and end."""
+    if len(text) <= max_len:
+        return text
+    half_len = (max_len - 20) // 2 # leave space for ellipsis
+    return f"{text[:half_len]}\n... (truncated) ...\n{text[-half_len:]}"
+
 def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int, memory_limit_kb: int, suffix: str = "") -> Dict[str, Any]:
     """
     Compiles and runs C++ code in a Docker sandbox, then uses a separate
     checker script to validate the output.
-    (V4 - Modular Runner/Checker Architecture with Verbose Logging & Time Measurement)
+    (V5 - Verbose Failure Reporting)
     """
     logging.info(f"--- VJS START: Problem {problem_id}{suffix} ---")
     if not pretests:
@@ -54,8 +62,8 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
         with open(source_path, "w", encoding="utf-8") as f: f.write(code)
 
         abs_host_dir = os.path.abspath(host_dir)
-        compile_cmd = ["docker", "run", "--rm", "-v", f"{abs_host_dir}:/app", "-w", "/app", "synapse-judge", "g++", "main.cpp", "-o", "main", "-O2", "-std=c++20", "-static"]
-        compile_proc = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=15)
+        compile_cmd = ["docker", "run", "--rm", "-v", f"{abs_host_dir}:/app", "-w", "/app", "synapse-judge", "g++", "main.cpp", "-o", "main", "-O2", "-std=c++23", "-static"]
+        compile_proc = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=VJS_COMPILATION_TIMEOUT)
 
         if compile_proc.returncode != 0:
             logging.error(f"[{problem_id}] Compilation FAILED.")
@@ -84,11 +92,19 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
                 try:
                     run_proc = subprocess.run(docker_run_cmd, stdin=stdin_f, stdout=stdout_f, stderr=subprocess.PIPE, text=True, timeout=timeout_sec + 5)
                 except subprocess.TimeoutExpired:
-                    return {'status': 'TIME_LIMIT_EXCEEDED', 'report': f'TLE on {test_num_str} (VJS Subsystem Timeout)'}
+                    report = f"TLE on {test_num_str} (VJS Subsystem Timeout).\n\n--- INPUT ---\n{_truncate_text(test['input'])}"
+                    return {'status': 'TIME_LIMIT_EXCEEDED', 'report': report}
 
-            if run_proc.returncode == 124: return {'status': 'TIME_LIMIT_EXCEEDED', 'report': f'TLE on {test_num_str}'}
-            if run_proc.returncode in [136, 137, 139]: return {'status': 'RUNTIME_ERROR', 'report': f'RE on {test_num_str} (signal {run_proc.returncode - 128})'}
-            if run_proc.returncode != 0: return {'status': 'RUNTIME_ERROR', 'report': f'RE on {test_num_str} (exit code {run_proc.returncode})'}
+            # --- VERBOSE FAILURE REPORTING ---
+            if run_proc.returncode == 124:
+                report = f"TLE on {test_num_str}.\n\n--- INPUT ---\n{_truncate_text(test['input'])}"
+                return {'status': 'TIME_LIMIT_EXCEEDED', 'report': report}
+            if run_proc.returncode in [136, 137, 139]:
+                report = f"RE on {test_num_str} (signal {run_proc.returncode - 128}).\n\n--- INPUT ---\n{_truncate_text(test['input'])}"
+                return {'status': 'RUNTIME_ERROR', 'report': report}
+            if run_proc.returncode != 0:
+                report = f"RE on {test_num_str} (exit code {run_proc.returncode}).\n\n--- INPUT ---\n{_truncate_text(test['input'])}"
+                return {'status': 'RUNTIME_ERROR', 'report': report}
 
             try:
                 time_output = run_proc.stderr.strip()
@@ -100,15 +116,32 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
             checker_cmd = ["python", "-m", "synapse.checker", input_path, output_path, answer_path]
             checker_proc = subprocess.run(checker_cmd, capture_output=True, text=True)
 
-            if checker_proc.returncode == WRONG_ANSWER: return {'status': 'WRONG_ANSWER', 'report': f'WA on {test_num_str}: {checker_proc.stdout.strip()}'}
-            if checker_proc.returncode == PRESENTATION_ERROR: return {'status': 'PRESENTATION_ERROR', 'report': f'PE on {test_num_str}: {checker_proc.stdout.strip()}'}
-            if checker_proc.returncode != ACCEPTED: return {'status': 'VJS_ERROR', 'report': f'Checker failed on {test_num_str}: {checker_proc.stdout.strip()}'}
+            if checker_proc.returncode in [WRONG_ANSWER, PRESENTATION_ERROR]:
+                user_output = "[Could not read user output file]"
+                try:
+                    with open(output_path, 'r', encoding='utf-8') as f: user_output = f.read()
+                except IOError: pass
+                
+                verdict = "WA" if checker_proc.returncode == WRONG_ANSWER else "PE"
+                report = (
+                    f"{verdict} on {test_num_str}: {checker_proc.stdout.strip()}\n\n"
+                    f"--- INPUT ---\n{_truncate_text(test['input'])}\n\n"
+                    f"--- EXPECTED OUTPUT ---\n{_truncate_text(test['output'])}\n\n"
+                    f"--- ACTUAL OUTPUT ---\n{_truncate_text(user_output)}"
+                )
+                status = 'WRONG_ANSWER' if verdict == "WA" else 'PRESENTATION_ERROR'
+                return {'status': status, 'report': report}
+
+            if checker_proc.returncode != ACCEPTED:
+                return {'status': 'VJS_ERROR', 'report': f'Checker failed on {test_num_str}: {checker_proc.stdout.strip()}'}
+            
             logging.info(f"[{problem_id}] {test_num_str}: PASSED.")
 
         logging.info(f"--- VJS SUCCESS: All {len(pretests)} tests passed for {problem_id}{suffix} ---")
         return {'status': 'SUCCESS', 'report': f'All {len(pretests)} tests passed', 'execution_time_ms': total_execution_time_ms}
     finally:
-        if os.path.exists(host_dir): shutil.rmtree(host_dir)                   
+        if os.path.exists(host_dir): shutil.rmtree(host_dir)
+
 def run_static_analysis(code: str) -> Dict[str, Any]:
     """Runs cppcheck for static analysis on a C++ code string."""
     with tempfile.NamedTemporaryFile(mode='w+', suffix='.cpp', delete=False) as temp_f:

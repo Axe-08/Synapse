@@ -1,3 +1,4 @@
+# synapse/optimizer.py
 import time
 import logging
 import sqlite3
@@ -18,7 +19,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - OPTIMIZER - %(leve
 
 class AIMDController:
     """Implements the Additive Increase, Multiplicative Decrease (AIMD) algorithm."""
-    # (This class is unchanged from your version)
     def __init__(self, param_name: str, increase_val: int = 1, decrease_factor: float = 0.5, min_val: int = 1, max_val: int = 8):
         self.param_name = param_name
         self.increase_val = increase_val
@@ -41,7 +41,6 @@ class AIMDController:
 
 class SystemState:
     """A simple class to hold the current calculated state of the pipeline."""
-    # --- UPGRADED ---
     def __init__(self):
         self.is_ip_banned: bool = False
         self.ingestion_recent_failures: int = 0
@@ -58,7 +57,6 @@ class SystemState:
 
 def get_pipeline_state(conn: sqlite3.Connection) -> SystemState:
     """Queries the database to build a snapshot of the current system state."""
-    # --- UPGRADED ---
     state = SystemState()
     cursor = conn.cursor()
     since_5_min = (datetime.now() - timedelta(minutes=5)).isoformat()
@@ -103,7 +101,7 @@ def main() -> None:
                 f"VJS Queue: {current_state.vjs_queue_size}"
             )
 
-            # --- NEW: PANIC MODE - HIGHEST PRIORITY ---
+            # --- PANIC MODE - HIGHEST PRIORITY ---
             if current_state.is_ip_banned and not state.is_in_cooldown('panic_mode'):
                 logging.critical("PANIC MODE: IP Ban Detected! Pausing all scraping activities for 2 hours.")
                 config_manager.set_param('ingestion_worker_count', 0)
@@ -115,7 +113,7 @@ def main() -> None:
                 state.record_action('ingestion_worker_count')
                 continue
 
-            # --- NEW: ADAPTIVE SCRAPER THROTTLE ---
+            # --- ADAPTIVE SCRAPER THROTTLE ---
             param = 'scraper_delay_seconds'
             if not state.is_in_cooldown(param):
                 current_delay = config_manager.get_param(param, DEFAULT_SCRAPER_DELAY_SECONDS)
@@ -131,29 +129,33 @@ def main() -> None:
                         config_manager.set_param(param, new_delay)
                         state.record_action(param)
 
-            # --- ORIGINAL: AIMD FOR API LIMITS ---
+            # --- BUGFIX: REFINED ANALYSIS WORKER CONTROL LOGIC ---
             param = 'analysis_worker_count'
             if not state.is_in_cooldown(param):
-                if analysis_worker_controller.update(current_state.analysis_api_rate_limited):
-                    logging.info("AIMD Controller adjusted analysis worker count.")
-                    state.record_action(param)
-
-            # --- ORIGINAL: PROPORTIONAL CONTROLLER FOR VJS QUEUE ---
-            if not state.is_in_cooldown(param):
-                error = TARGET_VJS_QUEUE_SIZE - current_state.vjs_queue_size
-                current_workers = config_manager.get_param(param)
-                if error < -10:
-                    new_workers = max(1, current_workers - 1)
-                    if new_workers != current_workers:
-                        logging.warning(f"VJS queue too long ({current_state.vjs_queue_size}). Throttling analysis: {current_workers} -> {new_workers}")
-                        config_manager.set_param(param, new_workers)
+                is_congested = current_state.analysis_api_rate_limited
+                
+                # AIMD controller has priority for congestion signals. It will decrease workers.
+                if is_congested:
+                    if analysis_worker_controller.update(True):
+                        logging.warning("AIMD: API rate limit detected. Reducing analysis workers.")
                         state.record_action(param)
-                elif error > 10:
-                    new_workers = min(MAX_ANALYSIS_WORKERS, current_workers + 1)
-                    if new_workers != current_workers:
-                        logging.info(f"VJS queue is short ({current_state.vjs_queue_size}). Increasing analysis: {current_workers} -> {new_workers}")
-                        config_manager.set_param(param, new_workers)
-                        state.record_action(param)
+                else:
+                    # If no congestion, use P-controller for queue management.
+                    error = TARGET_VJS_QUEUE_SIZE - current_state.vjs_queue_size
+                    current_workers = config_manager.get_param(param)
+                    
+                    if error < -10: # Queue is too long, decrease analysis workers
+                        new_workers = max(1, current_workers - 1)
+                        if new_workers != current_workers:
+                            logging.warning(f"VJS queue too long ({current_state.vjs_queue_size}). Throttling analysis: {current_workers} -> {new_workers}")
+                            config_manager.set_param(param, new_workers)
+                            state.record_action(param)
+                    elif error > 10: # Queue is short, increase analysis workers
+                        new_workers = min(MAX_ANALYSIS_WORKERS, current_workers + 1)
+                        if new_workers != current_workers:
+                            logging.info(f"VJS queue is short ({current_state.vjs_queue_size}). Increasing analysis: {current_workers} -> {new_workers}")
+                            config_manager.set_param(param, new_workers)
+                            state.record_action(param)
 
         except Exception as e:
             logging.error(f"Optimizer loop failed: {e}", exc_info=True)

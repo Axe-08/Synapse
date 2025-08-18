@@ -33,6 +33,7 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from config import DEFAULT_SELENIUM_LONG_WAIT, DEFAULT_SELENIUM_SHORT_WAIT, DEFAULT_SCRAPER_REQUEST_TIMEOUT, DEFAULT_SCRAPER_DELAY_SECONDS
 import synapse.database as db # To log the ban event
+from synapse.config_manager import config_manager # BUGFIX: Added import
 
 class IPBanException(Exception):
     """Custom exception for IP bans."""
@@ -147,6 +148,7 @@ def get_authenticated_driver() -> Optional[uc.Chrome]:
             logging.critical(f"Page did not load after {DEFAULT_SELENIUM_LONG_WAIT} seconds.")
             driver.save_screenshot("debug_cloudflare_failure.png")
             return None
+
         try:
             WebDriverWait(driver, 2).until(EC.presence_of_element_located((By.LINK_TEXT, "Logout")))
             logging.info("SUCCESS: Codeforces session is active.")
@@ -172,6 +174,7 @@ def get_authenticated_driver() -> Optional[uc.Chrome]:
             WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.LINK_TEXT, CF_HANDLE)))
             logging.info("SUCCESS: Login to Codeforces confirmed.")
             return driver
+
     except WebDriverException as e:
         logging.critical(f"A WebDriver error occurred during login: {e}", exc_info=True)
         if driver:
@@ -248,6 +251,7 @@ def _get_best_submission(contest_id: str, problem_index: str, exclude_ids: List[
             data = future.result()
             if not data or data.get('status') != 'OK' or not data.get('result'):
                 continue
+
             for sub in data['result']:
                 if str(sub.get('id')) in exclude_ids:
                     continue

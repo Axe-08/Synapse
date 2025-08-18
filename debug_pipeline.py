@@ -24,7 +24,7 @@ import synapse.database as db
 from synapse.key_manager import KeyManager
 from synapse.workers import (
     ingestion_worker,
-    calibration_worker, # FEATURE: Added calibration worker
+    calibration_worker,
     analysis_worker,
     implementation_worker,
     vjs_worker,
@@ -34,7 +34,6 @@ from synapse.scraper import get_authenticated_driver
 from create_database import (
     CREATE_PROBLEMS_TABLE_SQL, CREATE_WORKERS_TABLE_SQL,
     CREATE_PROCESS_HISTORY_TABLE_SQL, CREATE_WORKSPACE_TABLE_SQL,
-    # BUGFIX: Import the missing CREATE statements
     CREATE_METRICS_TABLE_SQL,
     CREATE_DYNAMIC_CONFIG_TABLE_SQL,
     CREATE_KEY_STATUS_TABLE_SQL
@@ -42,7 +41,7 @@ from create_database import (
 import config as default_config
 
 # --- Configuration ---
-DEBUG_PROBLEM_IDS: List[str] = ["1003A", "1003C", "1003D"]
+DEBUG_PROBLEM_IDS: List[str] = ["2077A","2077B","2077C","2077D","2077E"]
 MAX_ITERATIONS: int = 20 # Safety break to prevent infinite loops
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s')
 load_dotenv()
@@ -55,7 +54,6 @@ def print_header(title: str) -> None:
     print(f"--- {title.upper()} ---")
     print("="*80)
 
-# FEATURE: Helper function for verbose output
 def print_workspace_details(problem_id: str, fields: List[str]):
     """Prints specific fields from the workspace DB for a given problem."""
     try:
@@ -102,7 +100,7 @@ def main() -> None:
     db_writer.set_db_path(debug_progress_db)
     
     with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
-        # BUGFIX: Add the missing CREATE statements
+        # Create all tables before any other operations
         conn.execute(CREATE_PROBLEMS_TABLE_SQL)
         conn.execute(CREATE_WORKERS_TABLE_SQL)
         conn.execute(CREATE_PROCESS_HISTORY_TABLE_SQL)
@@ -117,7 +115,7 @@ def main() -> None:
             conn.execute("INSERT INTO live_workers (worker_id, pool, status, last_heartbeat) VALUES (?, ?, ?, ?)",
                          (f'DEBUG-{i}', 'DEBUG', 'idle', datetime.now().isoformat()))
         
-        # FEATURE: Populate dynamic config so scraper can read delay value
+        # Populate dynamic config so scraper can read delay value
         timestamp = datetime.now().isoformat()
         default_configs = [
             ('scraper_delay_seconds', str(default_config.DEFAULT_SCRAPER_DELAY_SECONDS), timestamp),
@@ -157,42 +155,34 @@ def main() -> None:
             print_header(f"ITERATION {iteration} | CURRENT STATUSES")
             print(json.dumps(statuses, indent=2))
             
-            # Check for completion
             terminal_states = {'completed', 'quarantined'} | {f'failed_{s}' for s in ['ingestion', 'calibration', 'analysis', 'implementation', 'vjs', 'data_assembly']}
             if all(s in terminal_states for s in statuses.values()):
                 logging.info("All problems have reached a terminal state. Ending debug run.")
                 break
 
             # --- Dispatch jobs based on current status ---
-            
-            # --- STAGE 2: CALIBRATION (Single-job worker) ---
             for pid, status in statuses.items():
                 if status == 'pending_calibration':
                     job = {'id': pid, 'rating': 0}
                     print_header(f"Dispatching '{pid}' to CALIBRATION worker")
                     calibration_worker(job, 'CALIBRATION-1')
 
-            # --- STAGE 3: ANALYSIS (Batched worker) ---
             analysis_jobs = [{'id': pid} for pid, s in statuses.items() if s == 'pending_analysis']
             if analysis_jobs:
                 print_header(f"Dispatching {len(analysis_jobs)} jobs to ANALYSIS worker")
                 analysis_worker(analysis_jobs, 'ANALYSIS-1', gemini_km)
-                # FEATURE: Print verbose output
                 for job in analysis_jobs:
                     print_workspace_details(job['id'], ['arl_pseudocode'])
 
-            # --- STAGES 4-7: OTHER SINGLE-JOB WORKERS ---
             for pid, status in statuses.items():
                 job = {'id': pid, 'rating': 0}
                 if status == 'pending_implementation':
                     print_header(f"Dispatching '{pid}' to IMPLEMENTATION worker")
                     implementation_worker(job, 'IMPLEMENTATION-1', groq_km)
-                    # FEATURE: Print verbose output
                     print_workspace_details(pid, ['arl_reconstructed_code'])
                 elif status == 'pending_vjs':
                     print_header(f"Dispatching '{pid}' to VJS worker")
                     vjs_worker(job, 'VJS-1')
-                    # FEATURE: Print verbose output
                     print_workspace_details(pid, ['vjs_last_report'])
                 elif status == 'pending_data_assembly':
                     print_header(f"Dispatching '{pid}' to DATA ASSEMBLY worker")
@@ -202,10 +192,12 @@ def main() -> None:
                     ingestion_worker(job, 'INGESTION-1', browser_queue)
 
             db_writer.wait_for_completion()
-            time.sleep(2) # Pause to allow observing state changes
+            time.sleep(2)
 
         if iteration >= MAX_ITERATIONS and not all(s in terminal_states for s in get_all_problem_statuses().values()):
             logging.warning("Max iterations reached. Ending debug run to prevent infinite loop.")
+    except KeyboardInterrupt:
+        logging.info("\nShutdown signal received.")
     except Exception as e:
         logging.critical("Debug pipeline failed unexpectedly.", exc_info=True)
     finally:

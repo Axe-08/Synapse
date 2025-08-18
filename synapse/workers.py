@@ -26,12 +26,17 @@ from synapse.key_manager import KeyManager
 from synapse.vjs import run_vjs, run_static_analysis, run_semantic_analysis
 from synapse.data_assembly import _assemble_golden_record, _parse_memory_limit, _parse_time_limit
 from synapse.data_manager import append_to_dataset
-from config import MAX_ANALYSIS_RETRIES, MAX_IMPLEMENTATION_RETRIES, MAX_RESCRAPING_ATTEMPTS
+from config import (
+    MAX_ANALYSIS_RETRIES, 
+    MAX_IMPLEMENTATION_RETRIES, 
+    MAX_RESCRAPING_ATTEMPTS,
+    INITIAL_CALIBRATION_TOLERANCE_FACTOR
+)
 MAX_BROWSER_USES=25
 from .vjs import run_vjs, run_static_analysis, run_semantic_analysis
 from .data_assembly import _parse_memory_limit, _parse_time_limit
 # --- STAGE 1: INGESTION & RE-SCRAPING ---
-def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Queue):
+def ingestion_worker(problem: Dict[str, Any], worker_id: str, browser_queue: Queue):
     """
     Handles scraping all necessary data for a problem from Codeforces.
     This worker can also perform re-scraping to find a new reference solution
@@ -131,7 +136,13 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: int, browser_queue: Que
         db.update_worker_status(worker_id, 'INGESTION', None, None, 'idle')
 
 # --- NEW STAGE 2: CALIBRATION ---
-def calibration_worker(problem: Dict[str, Any], worker_id: int):
+# --- STAGE 2: CALIBRATION ---
+# --- STAGE 2: CALIBRATION ---
+def calibration_worker(problem: Dict[str, Any], worker_id: str):
+    """
+    Observes the ground-truth solution to deduce VJS rules (checker mode,
+    slowness factor) for this specific problem.
+    """
     problem_id = problem['id']
     logging.info(f"[{problem_id}] Starting CALIBRATION stage...")
     db.update_worker_status(worker_id, 'CALIBRATION', problem_id, 'VALIDATING', 'active')
@@ -144,41 +155,62 @@ def calibration_worker(problem: Dict[str, Any], worker_id: int):
         problem_time_limit_ms = _parse_time_limit(workspace_data.get('time_limit_raw', '1s'))
         memory_limit_kb = _parse_memory_limit(workspace_data.get('memory_limit_raw', '256mb'))
         ref_submission_obj = json.loads(workspace_data.get('reference_solution_json', '{}'))
-        official_ref_time_ms = ref_submission_obj.get('timeConsumedMillis', 500) # Default if missing
+        official_ref_time_ms = ref_submission_obj.get('timeConsumedMillis', 500)
 
-        ref_vjs_result = run_vjs(problem_id, reference_code, all_pretests, problem_time_limit_ms, memory_limit_kb, suffix="_ref_calib")
+        # Apply a lenient time limit for the initial calibration run.
+        lenient_time_limit_ms = int(problem_time_limit_ms * INITIAL_CALIBRATION_TOLERANCE_FACTOR)
+
+        ref_vjs_result = run_vjs(
+            problem_id, reference_code, all_pretests, 
+            lenient_time_limit_ms, memory_limit_kb, suffix="_ref_calib"
+        )
         
-        # Treat PE as success for calibration purposes
-        if ref_vjs_result['status'] in ['SUCCESS', 'PRESENTATION_ERROR']:
+        # FEATURE: Deduce rules based on the outcome for the ground-truth solution.
+        if ref_vjs_result['status'] == 'SUCCESS' or ref_vjs_result['status'] == 'PRESENTATION_ERROR':
+            # DEDUCE CHECKER MODE: If it passes with PE, it means a set-based check was successful.
+            checker_mode = 'strict' if ref_vjs_result['status'] == 'SUCCESS' else 'set_based'
+            logging.info(f"[{problem_id}] Calibration check passed. Deduced checker mode: {checker_mode}.")
+            
+            # CALCULATE SLOWNESS FACTOR
             local_ref_time_ms = ref_vjs_result.get('execution_time_ms', official_ref_time_ms)
-            slowness_factor = 2.0 # Default safe value
+            slowness_factor = 2.0
             if official_ref_time_ms > 0 and local_ref_time_ms > 0:
                 slowness_factor = local_ref_time_ms / official_ref_time_ms
-            slowness_factor = max(1.0, min(slowness_factor, 10.0)) # Clamp the factor
+            slowness_factor = max(1.0, min(slowness_factor, 10.0))
 
-            db.save_calibration_results(problem_id, all_pretests, slowness_factor)
+            # SAVE VJS PROFILE
+            db.save_calibration_results(problem_id, all_pretests, slowness_factor, checker_mode)
             db.transition_to_pending_analysis(problem_id)
             logging.info(f"[{problem_id}] Calibration SUCCEEDED. Slowness factor: {slowness_factor:.2f}. -> pending_analysis")
         else:
-            logging.warning(f"[{problem_id}] Calibration FAILED with status {ref_vjs_result['status']}.")
+            # UNRECOVERABLE FAILURE: The reference solution is either too slow even with leniency,
+            # or it's brittle (RE/WA). It is unsuitable for analysis.
+            detailed_report = ref_vjs_result.get('report', 'No detailed report available.')
+            logging.warning(
+                f"[{problem_id}] Calibration FAILED with status {ref_vjs_result['status']}.\n"
+                f"--- VJS CALIBRATION REPORT ---\n"
+                f"{detailed_report}"
+            )
+            
             with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
                 cursor = conn.execute("SELECT rescraping_attempts FROM problems WHERE id = ?", (problem_id,))
                 rescrapes = cursor.fetchone()[0]
             
             if rescrapes < MAX_RESCRAPING_ATTEMPTS:
-                logging.info(f"[{problem_id}] Triggering re-scrape attempt {rescrapes + 1}/{MAX_RESCRAPING_ATTEMPTS}.")
+                logging.info(f"[{problem_id}] Reference solution is unsuitable. Triggering re-scrape attempt {rescrapes + 1}/{MAX_RESCRAPING_ATTEMPTS}.")
                 db.transition_to_pending_rescraping(problem_id, str(ref_submission_obj.get('id', 'unknown')))
             else:
-                reason = f"Calibration FAILED after {MAX_RESCRAPING_ATTEMPTS} attempts. Last failure: {ref_vjs_result['status']}"
+                reason = f"Calibration FAILED after {MAX_RESCRAPING_ATTEMPTS} attempts to find a suitable reference. Last failure: {ref_vjs_result['status']}"
                 db.transition_to_quarantined(problem_id, reason)
     except Exception as e:
         logging.error(f"FAILED [Calibration] for {problem_id}: {e}", exc_info=False)
         db.transition_to_failed(problem_id, 'calibration', str(e))
     finally:
         db.update_worker_status(worker_id, 'CALIBRATION', None, None, 'idle')
-        
+       
+       
 # --- STAGE 2: ANALYSIS (BATCHED) ---
-def analysis_worker(batch: List[Dict[str, Any]], worker_id: int, gemini_km: KeyManager):
+def analysis_worker(batch: List[Dict[str, Any]], worker_id: str, gemini_km: KeyManager):
     """
     Processes a batch of problems, sending them to the Gemini "Analyst" LLM
     to generate pseudocode. It also handles the logic for quarantining or
@@ -299,39 +331,43 @@ def implementation_worker(problem: Dict[str, Any], worker_id: int, groq_km: KeyM
 
 # --- STAGE 4: VJS (Verification & Judging Service) ---
 
-def vjs_worker(problem: Dict[str, Any], worker_id: int):
+def vjs_worker(problem: Dict[str, Any], worker_id: str):
     """
-    (V2 - Simplified) Judges only the reconstructed code using pre-calculated and
-    pre-validated data from the calibration stage.
+    Judges the AI-generated code using the VJS Profile determined
+    during the calibration stage.
     """
     problem_id = problem['id']
-    logging.info(f"[{problem_id}] Starting SIMPLIFIED VJS stage...")
+    logging.info(f"[{problem_id}] Starting VJS stage for generated code...")
     db.update_worker_status(worker_id, 'VJS', problem_id, 'JUDGING', 'active')
     try:
         workspace_data = db.get_batch_data_from_workspace([problem_id]).get(problem_id)
-        if not workspace_data:
-            raise Exception("Workspace data not found for VJS.")
+        if not workspace_data: raise Exception("Workspace data not found for VJS.")
 
+        # Load the VJS Profile from the calibration stage
         reconstructed_code = workspace_data.get('arl_reconstructed_code')
-        # --- Load VALIDATED data from the calibration stage ---
         validated_pretests = json.loads(workspace_data.get('validated_pretests_json', '[]'))
         slowness_factor = workspace_data.get('slowness_factor', 2.0)
+        checker_mode = workspace_data.get('checker_mode', 'strict') # Default to strict
         
         problem_time_limit_ms = _parse_time_limit(workspace_data.get('time_limit_raw', '1s'))
         memory_limit_kb = _parse_memory_limit(workspace_data.get('memory_limit_raw', '256mb'))
         
         if not all([reconstructed_code, validated_pretests]):
-            raise Exception("Missing required data for simplified VJS (reconstructed code or validated pretests).")
+            raise Exception("Missing required data for VJS (reconstructed code or validated pretests).")
             
         adjusted_time_limit_ms = int(problem_time_limit_ms * slowness_factor)
-
         vjs_result = run_vjs(problem_id, reconstructed_code, validated_pretests, adjusted_time_limit_ms, memory_limit_kb, suffix="_arl")
         
-        logging.info(f"[{problem_id}] Final VJS result: {vjs_result['status']}")
+        # FEATURE: Interpret the verdict using the calibrated checker mode.
+        final_status = vjs_result['status']
+        if checker_mode == 'set_based' and final_status == 'PRESENTATION_ERROR':
+            logging.info(f"[{problem_id}] PE verdict promoted to SUCCESS based on set-based checker calibration.")
+            final_status = 'SUCCESS'
 
-        # --- Handle Final Verdict ---
-        report_for_llm = ""
-        if vjs_result['status'] in ['SUCCESS', 'PRESENTATION_ERROR']:
+        logging.info(f"[{problem_id}] Final VJS verdict: {final_status}")
+        report_for_llm = vjs_result.get('report', '')
+
+        if final_status == 'SUCCESS':
             db.update_worker_status(worker_id, 'VJS', problem_id, 'ANALYZING', 'active')
             reference_code = workspace_data.get('reference_solution_code')
             analysis = {'reference_analysis': {}, 'reconstructed_analysis': {}}
@@ -341,17 +377,14 @@ def vjs_worker(problem: Dict[str, Any], worker_id: int):
             db.update_workspace_with_quality_analysis(problem_id, json.dumps(analysis))
             db.transition_to_pending_data_assembly(problem_id)
 
-        elif vjs_result['status'] == 'COMPILE_ERROR':
-            report_for_llm = f"**Compiler Output:**\n```\n{vjs_result['report']}\n```\nFix the syntax."
+        elif final_status == 'COMPILE_ERROR':
             db.transition_to_pending_implementation_retry(problem_id, report_for_llm)
-
-        elif vjs_result['status'] in ['TIME_LIMIT_EXCEEDED', 'WRONG_ANSWER', 'RUNTIME_ERROR']:
-            report_for_llm = f"**Failure Type:** {vjs_result['status']}\n**Report:** {vjs_result['report']}\nThe core algorithm is flawed. Re-evaluate the logic and generate new, correct pseudocode."
+        elif final_status in ['TIME_LIMIT_EXCEEDED', 'WRONG_ANSWER', 'RUNTIME_ERROR', 'PRESENTATION_ERROR']:
             db.transition_to_pending_analysis_retry(problem_id, report_for_llm)
         else:
-            raise Exception(f"VJS system error: {vjs_result.get('report', 'Unknown')}")
+            raise Exception(f"VJS system error: {report_for_llm}")
 
-        if report_for_llm:
+        if final_status != 'SUCCESS':
             with db._get_db_connection(db.WORKSPACE_DB_PATH) as conn:
                 conn.execute("UPDATE problem_data_cache SET vjs_last_report = ? WHERE problem_id = ?", (report_for_llm, problem_id))
 
@@ -360,8 +393,9 @@ def vjs_worker(problem: Dict[str, Any], worker_id: int):
         db.transition_to_failed(problem_id, 'vjs', str(e))
     finally:
         db.update_worker_status(worker_id, 'VJS', None, None, 'idle')
+
     # --- STAGE 5: DATA ASSEMBLY ---
-def data_assembly_worker(problem: Dict[str, Any], worker_id: int):
+def data_assembly_worker(problem: Dict[str, Any], worker_id: str):
     """
     Performs the final step for a successfully verified problem. It assembles
     the "golden record" from all the data in the workspace, appends it to the

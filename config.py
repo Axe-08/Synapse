@@ -42,6 +42,10 @@ DEFAULT_SCRAPER_DELAY_SECONDS: float = 2.5
 MAX_SCRAPER_DELAY_SECONDS: float = 10.0
 # --- VJS Timeouts (in seconds) ---
 VJS_COMPILATION_TIMEOUT: int = 15
+# A generous multiplier for the first calibration run to account for local
+# machine speed vs. judging servers.
+INITIAL_CALIBRATION_TOLERANCE_FACTOR: float = 3.0
+
 # -----------------------------------------------------------------------------
 # --- Optimizer & Control System Configuration ---
 # -----------------------------------------------------------------------------

@@ -17,16 +17,19 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from queue import Queue
+
 # --- Configuration & Setup ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s'
 )
+
 # Import from our project modules
 from synapse import database as db
 from synapse.key_manager import KeyManager
 from synapse.workers import (
     ingestion_worker,
+    calibration_worker, # FEATURE: Added calibration worker
     analysis_worker,
     implementation_worker,
     vjs_worker,
@@ -34,12 +37,14 @@ from synapse.workers import (
 )
 from synapse.database_writer import db_writer
 from synapse.config_manager import config_manager
+
 # --- Load Environment Variables ---
 load_dotenv()
 GEMINI_API_KEYS: list[str] = [key.strip() for key in os.getenv('GEMINI_API_KEYS', '').split(',') if key.strip()]
 GROQ_API_KEYS: list[str] = [key.strip() for key in os.getenv('GROQ_API_KEYS', '').split(',') if key.strip()]
 if not GEMINI_API_KEYS or not GROQ_API_KEYS:
     logging.warning("API keys not found in .env file. ARL workers may fail.")
+
 def key_health_monitor(stop_event: threading.Event, gemini_km: KeyManager, groq_km: KeyManager) -> None:
     """
     A background thread that periodically triggers the internal state-check
@@ -58,6 +63,7 @@ def key_health_monitor(stop_event: threading.Event, gemini_km: KeyManager, groq_
                 groq_km._check_and_reset_windows()
         except Exception as e:
             logging.warning(f"Key health monitor encountered an error: {e}")
+        
         # Sleep for a short duration, checking the stop_event frequently
         for _ in range(10):
             if stop_event.is_set():
@@ -70,6 +76,7 @@ def manage_pools(current_pools: dict, current_counts: dict) -> tuple[dict, dict]
     # Get the latest desired counts from the now DB-backed config manager
     desired_counts = {
         'INGESTION': config_manager.get_param('ingestion_worker_count'),
+        'CALIBRATION': config_manager.get_param('ingestion_worker_count'), # Calibration runs at same rate as ingestion
         'ANALYSIS': config_manager.get_param('analysis_worker_count'),
         'IMPLEMENTATION': config_manager.get_param('implementation_worker_count'),
         'VJS': config_manager.get_param('vjs_worker_count'),
@@ -129,6 +136,7 @@ def main(args: argparse.Namespace) -> None:
     # This mapping is static
     stage_definitions = {
         'INGESTION': (ingestion_worker, ('browser_queue',)),
+        'CALIBRATION': (calibration_worker, ()), # FEATURE: Added calibration stage
         'ANALYSIS': (analysis_worker, ('gemini_key_manager',)),
         'IMPLEMENTATION': (implementation_worker, ('groq_key_manager',)),
         'VJS': (vjs_worker, ()),
@@ -184,10 +192,10 @@ def main(args: argparse.Namespace) -> None:
                     if batch_size > 1:
                         for j in range(0, len(jobs), batch_size):
                             batch = jobs[j:j+batch_size]
-                            pool.submit(worker_func, batch, (j // batch_size) + 1, *worker_args)
+                            pool.submit(worker_func, batch, f"{stage_name}-{(j // batch_size) + 1}", *worker_args)
                     else:
                         for j, job in enumerate(jobs):
-                            pool.submit(worker_func, job, j + 1, *worker_args)
+                            pool.submit(worker_func, job, f"{stage_name}-{j + 1}", *worker_args)
 
             if args.run_once:
                 logging.info("--run-once specified. Exiting after one cycle.")
@@ -205,8 +213,9 @@ def main(args: argparse.Namespace) -> None:
         stop_event.set()
         logging.info("Shutting down all worker pools...")
         for stage_name, pool in active_pools.items():
-            pool.shutdown(wait=True, cancel_futures=False)
-            logging.info(f"{stage_name.capitalize()} pool has shut down.")
+            if pool:
+                pool.shutdown(wait=True, cancel_futures=False)
+                logging.info(f"{stage_name.capitalize()} pool has shut down.")
         
         logging.info("Cleaning up browser instances...")
         while not browser_queue.empty():

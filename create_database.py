@@ -116,7 +116,8 @@ CREATE TABLE IF NOT EXISTS problem_data_cache (
     time_limit_raw TEXT,
     memory_limit_raw TEXT,
     validated_pretests_json TEXT,
-    slowness_factor REAL 
+    slowness_factor REAL,
+    checker_mode TEXT -- FEATURE: 'strict' or 'set_based'
 );
 """
 
