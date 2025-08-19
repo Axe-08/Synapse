@@ -31,7 +31,13 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-from config import DEFAULT_SELENIUM_LONG_WAIT, DEFAULT_SELENIUM_SHORT_WAIT, DEFAULT_SCRAPER_REQUEST_TIMEOUT, DEFAULT_SCRAPER_DELAY_SECONDS
+from config import (
+    DEFAULT_SELENIUM_LONG_WAIT,
+    DEFAULT_SELENIUM_SHORT_WAIT, 
+    DEFAULT_SCRAPER_REQUEST_TIMEOUT, 
+    DEFAULT_SCRAPER_DELAY_SECONDS,
+    N_REFERENCE_SOLUTIONS
+) 
 import synapse.database as db # To log the ban event
 from synapse.config_manager import config_manager # BUGFIX: Added import
 
@@ -245,7 +251,7 @@ def _fetch_submission_page(url: str) -> Optional[dict]:
         return None
 
 
-def _get_best_submission(contest_id: str, problem_index: str, exclude_ids: List[str]) -> Optional[List[Dict]]:
+def _get_top_submissions(contest_id: str, problem_index: str, exclude_ids: List[str]) -> Optional[List[Dict]]:
     """
     Finds suitable 'Accepted' C++ submissions for a problem via the API.
 
@@ -283,21 +289,13 @@ def _get_best_submission(contest_id: str, problem_index: str, exclude_ids: List[
         return None
 
     all_candidates.sort(key=lambda x: x['author'].get('rating', -1), reverse=True)
-    logging.info(f"Found {len(all_candidates)} candidate submissions.")
-    return all_candidates
-
+    top_n_candidates = all_candidates[:N_REFERENCE_SOLUTIONS]
+    logging.info(f"Found {len(all_candidates)} candidates, returning top {len(top_n_candidates)}.")
+    return top_n_candidates
 
 def fetch_problem_data(problem_id: str, driver: uc.Chrome, exclude_submission_ids: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """
     Orchestrates the fetching of all problem data using a hybrid approach.
-
-    Args:
-        problem_id: The unique ID of the problem (e.g., "1003A").
-        driver: An authenticated Selenium driver instance.
-        exclude_submission_ids: A list of submission IDs to exclude from the search.
-
-    Returns:
-        A dictionary containing all aggregated data for the problem, or None on critical failure.
     """
     if exclude_submission_ids is None:
         exclude_submission_ids = []
@@ -313,27 +311,33 @@ def fetch_problem_data(problem_id: str, driver: uc.Chrome, exclude_submission_id
     if not page_details:
         return None
 
-    # Step 2: Find the best reference submission via the API
-    candidate_submissions = _get_best_submission(str(contest_id), problem_index, exclude_ids=exclude_submission_ids)
+    # Step 2: Find the top N reference submissions via the API
+    # --- FIX: Function name was _get_top_submission, should be plural ---
+    candidate_submissions = _get_top_submissions(str(contest_id), problem_index, exclude_ids=exclude_submission_ids)
     if not candidate_submissions:
         return None
 
-    # Step 3: Use the browser to scrape the source code
-    solution_code, ref_submission = None, None
-    for candidate in candidate_submissions[:5]:  # Try top 5 candidates
+    # Step 3: Use the browser to scrape the source code for ALL candidates
+    successful_candidates = []
+    for candidate in candidate_submissions:
         submission_url = SUBMISSION_URL_TEMPLATE.format(contestId=candidate['contestId'], submissionId=candidate['id'])
         source_code_text = _get_source_from_page(driver, submission_url)
         if source_code_text:
-            solution_code = source_code_text
-            ref_submission = candidate
-            logging.info(f"[{problem_id}] SUCCESS: Found valid source code in submission {candidate['id']}.")
-            break
+            successful_candidates.append({
+                "submission_object": candidate,
+                "source_code": source_code_text
+            })
+            logging.info(f"[{problem_id}] SUCCESS: Scraped source for submission {candidate['id']}.")
         else:
-            logging.warning(f"[{problem_id}] Failed to get source for submission {candidate['id']}. Trying next.")
+            logging.warning(f"[{problem_id}] Failed to get source for submission {candidate['id']}. Skipping.")
+        # --- BUGFIX: Removed 'break' to ensure we collect ALL successful oracles ---
 
-    if not solution_code or not ref_submission:
+    if not successful_candidates:
         logging.critical(f"[{problem_id}] Could not find any submissions with accessible source code.")
         return None
+
+    # --- BUGFIX: Define ref_submission using the primary oracle for the API call ---
+    ref_submission = successful_candidates[0]['submission_object']
 
     # Step 4: Hybrid Pretest Strategy (enrich with internal API)
     pretests = page_details['example_pretests']
@@ -346,6 +350,7 @@ def fetch_problem_data(problem_id: str, driver: uc.Chrome, exclude_submission_id
 
     if csrf_token_meta:
         csrf_token = csrf_token_meta['content']
+        # This line will now work correctly
         payload = {'submissionId': ref_submission['id'], 'csrf_token': csrf_token}
         try:
             logging.info(f"[{problem_id}] Attempting to enrich pretests via internal API...")
@@ -367,16 +372,14 @@ def fetch_problem_data(problem_id: str, driver: uc.Chrome, exclude_submission_id
             else:
                 logging.warning(f"[{problem_id}] API enrichment returned no pretests. Falling back to {len(pretests)} examples scraped from HTML.")
             # --- END CORRECTION ---
-
         except Exception as e:
             logging.warning(f"[{problem_id}] Internal API call for pretests failed: {e}")
-
 
     # Step 5: Assemble and return
     return {
         "problem_id": problem_id,
         "page_details": page_details,
-        "ref_submission": ref_submission,
-        "solution_code": solution_code,
+        # --- BUGFIX: Return the list of all successful candidates ---
+        "successful_solutions": successful_candidates,
         "pretests": pretests,
     }

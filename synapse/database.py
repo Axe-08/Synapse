@@ -170,7 +170,7 @@ def transition_to_failed(problem_id: str, stage: str, notes: str):
 
 def transition_to_pending_calibration(problem_id: str):
     _update_problem_status(problem_id, 'pending_calibration')
-    save_process_history(problem_id, 'INGESTION', 'SUCCESS', 'Data ingested. Ready for calibration.')
+    save_process_history(problem_id, 'INGESTION', 'SUCCESS', 'Multi-oracle data ingested. Ready for calibration.')
 
 # --- ADD THIS NEW WORKSPACE SAVE FUNCTION ---
 def save_calibration_results(problem_id: str, validated_pretests: List[Dict], slowness_factor: float, checker_mode: str):
@@ -182,6 +182,44 @@ def save_calibration_results(problem_id: str, validated_pretests: List[Dict], sl
                WHERE problem_id = ?""",
             (json.dumps(validated_pretests), slowness_factor, checker_mode, problem_id)
         )
+def save_multi_oracle_ingestion_data(problem_id: str, html: str, pretests: list, successful_solutions: list):
+    """
+    Saves the ingested multi-oracle data to the appropriate tables in the
+    progress and workspace databases.
+    """
+    if not successful_solutions:
+        raise ValueError("successful_solutions list cannot be empty.")
+
+    # 1. Separate the primary oracle from the secondaries
+    primary_solution = successful_solutions[0]
+    secondary_solutions = successful_solutions[1:]
+
+    primary_submission_obj = primary_solution['submission_object']
+    primary_solution_code = primary_solution['source_code']
+    secondary_codes = [s['source_code'] for s in secondary_solutions]
+    
+    # 2. (SYNC) Write all necessary data to the workspace cache for immediate use
+    with _get_db_connection(WORKSPACE_DB_PATH) as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO problem_data_cache
+               (problem_id, problem_statement_html, reference_solution_json, 
+                reference_solution_code, secondary_reference_codes_json, pretests_json)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                problem_id,
+                html,
+                json.dumps(primary_submission_obj),
+                primary_solution_code,
+                json.dumps(secondary_codes),
+                json.dumps(pretests)
+            )
+        )
+    
+    # 3. (ASYNC) Update the main problems table with the full list of submission objects
+    all_submission_objects = [s['submission_object'] for s in successful_solutions]
+    sql = "UPDATE problems SET reference_submissions_json = ? WHERE id = ?"
+    params = (json.dumps(all_submission_objects), problem_id)
+    db_writer.execute(sql, params)
 
 def transition_to_pending_rescraping(problem_id: str, failed_submission_id: str):
     """(Hybrid) Transitions a problem to re-scraping after max analysis retries."""

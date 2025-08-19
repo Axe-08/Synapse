@@ -60,3 +60,12 @@ OPTIMIZER_COOLDOWN_PERIOD_SECONDS: int = 300  # 5 minutes
 # buffer, ensuring workers are not idle without creating excessive latency.
 TARGET_VJS_QUEUE_SIZE: int = 20
 TARGET_ANALYSIS_QUEUE_SIZE: int = 50
+
+# -----------------------------------------------------------------------------
+# --- N-Version Programming & Verification ---
+# -----------------------------------------------------------------------------
+# The number of top-rated reference solutions to scrape for each problem.
+N_REFERENCE_SOLUTIONS: int = 5
+# The minimum number of reference solutions that must compile successfully
+# in the calibration stage for the problem to proceed.
+MIN_VIABLE_ORACLES: int = 3

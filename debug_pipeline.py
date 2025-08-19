@@ -1,6 +1,6 @@
 # debug_pipeline.py
 """
-A sequential, state-driven debugging script for the Project Synapse pipeline.
+A sequential, state-driven debugging script for the Project Synapse v2.0 pipeline.
 This script simulates the pipeline's state transitions and retry mechanisms
 in a single thread. It is designed to be highly verbose, printing the
 full state and data artifacts at each step to help diagnose issues.
@@ -36,9 +36,10 @@ from create_database import (
     CREATE_KEY_STATUS_TABLE_SQL
 )
 import config as default_config
+from config import N_REFERENCE_SOLUTIONS, MIN_VIABLE_ORACLES # Import new v2.0 config
 
 # --- Configuration ---
-DEBUG_PROBLEM_IDS: List[str] = ["2066B"] # Use a simple, well-known problem for debugging
+DEBUG_PROBLEM_IDS: List[str] = ["2066B"] # Target question for this debug run
 MAX_ITERATIONS: int = 20 # Safety break to prevent infinite loops
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s')
 load_dotenv()
@@ -51,50 +52,67 @@ def print_header(title: str) -> None:
     print(f"\n{bar}\n--- {title.upper()} ---\n{bar}")
 
 def print_workspace_details(problem_id: str, stage_name: str):
-    """Prints specific fields from the workspace DB for a given problem."""
+    """Prints specific fields from both workspace and progress DBs for a given problem."""
     print(f"\n--- ARTIFACTS AFTER {stage_name.upper()} for {problem_id} ---")
     try:
+        # Print from workspace.db
         with db._get_db_connection(db.WORKSPACE_DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM problem_data_cache WHERE problem_id = ?", (problem_id,))
             row = cursor.fetchone()
             if not row:
                 print(f"No workspace data found for {problem_id}")
-                return
+            else:
+                fields_to_print = {
+                    'INGESTION': ['reference_solution_code', 'secondary_reference_codes_json', 'pretests_json'],
+                    'CALIBRATION': ['compiled_oracle_paths_json', 'validated_pretests_json', 'slowness_factor', 'checker_mode'],
+                    'ANALYSIS': ['arl_pseudocode'],
+                    'IMPLEMENTATION': ['arl_reconstructed_code'],
+                    'VJS': ['vjs_last_report']
+                }
+                for field in fields_to_print.get(stage_name.upper(), []):
+                    print(f"\n>>> WORKSPACE Field: {field}\n")
+                    content = row[field]
+                    if not content: print("[EMPTY]")
+                    else:
+                        try: print(json.dumps(json.loads(content), indent=2))
+                        except (json.JSONDecodeError, TypeError): print(content)
+        
+        # Print from progress.db
+        with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("SELECT * FROM problems WHERE id = ?", (problem_id,))
+            row = cursor.fetchone()
+            if row:
+                fields_to_print_progress = {
+                    'INGESTION': ['reference_submissions_json'],
+                    'CALIBRATION': ['successful_oracles', 'confidence_level'],
+                    'VJS': ['confidence_level']
+                }
+                for field in fields_to_print_progress.get(stage_name.upper(), []):
+                    print(f"\n>>> PROGRESS Field: {field}\n")
+                    content = row[field]
+                    if not content: print("[EMPTY]")
+                    else:
+                        try: print(json.dumps(json.loads(content), indent=2))
+                        except (json.JSONDecodeError, TypeError): print(content)
 
-            fields_to_print = {
-                'INGESTION': ['problem_statement_html', 'reference_solution_code', 'pretests_json'],
-                'CALIBRATION': ['validated_pretests_json', 'slowness_factor', 'checker_mode', 'vjs_last_report'],
-                'ANALYSIS': ['arl_pseudocode'],
-                'IMPLEMENTATION': ['arl_reconstructed_code'],
-                'VJS': ['vjs_last_report']
-            }
-
-            for field in fields_to_print.get(stage_name.upper(), []):
-                print(f"\n>>> Field: {field}\n")
-                content = row[field]
-                if not content:
-                    print("[EMPTY]")
-                    continue
-                # Try to pretty-print if it's JSON
-                try:
-                    parsed_json = json.loads(content)
-                    print(json.dumps(parsed_json, indent=2))
-                except (json.JSONDecodeError, TypeError):
-                    print(content)
     except Exception as e:
         print(f"Could not print workspace details for {problem_id}: {e}")
     print("-" * 50)
 
-
-def get_all_problem_statuses() -> Dict[str, str]:
-    """Fetches the current status of all debug problems."""
+def get_all_problem_statuses() -> Dict[str, Dict]:
+    """Fetches a rich status object for all debug problems."""
     statuses = {}
     with db._get_db_connection('debug.db') as conn:
         placeholders = ','.join('?' for _ in DEBUG_PROBLEM_IDS)
-        cursor = conn.execute(f"SELECT id, status FROM problems WHERE id IN ({placeholders})", DEBUG_PROBLEM_IDS)
+        cursor = conn.execute(f"SELECT id, status, successful_oracles, confidence_level FROM problems WHERE id IN ({placeholders})", DEBUG_PROBLEM_IDS)
         for row in cursor.fetchall():
-            statuses[row[0]] = row[1]
+            statuses[row[0]] = {
+                "status": row[1],
+                "successful_oracles": row[2],
+                "confidence_level": row[3]
+            }
     return statuses
 
 def main() -> None:
@@ -103,8 +121,8 @@ def main() -> None:
         logging.error("API keys not found in .env file. Exiting.")
         return
 
-    # --- SETUP ---
     print_header(f"SETUP: PREPARING DEBUG RUN FOR {len(DEBUG_PROBLEM_IDS)} PROBLEMS")
+    print(f"v2.0 Config: N_REFERENCE_SOLUTIONS={N_REFERENCE_SOLUTIONS}, MIN_VIABLE_ORACLES={MIN_VIABLE_ORACLES}")
     
     debug_progress_db = 'debug.db'
     debug_workspace_db = 'debug_workspace.db'
@@ -116,6 +134,7 @@ def main() -> None:
     db.WORKSPACE_DB_PATH = debug_workspace_db
     db_writer.set_db_path(debug_progress_db)
     
+    # --- SETUP DATABASES ---
     with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
         conn.execute(CREATE_PROBLEMS_TABLE_SQL)
         conn.execute(CREATE_WORKERS_TABLE_SQL)
@@ -126,36 +145,21 @@ def main() -> None:
 
         for pid in DEBUG_PROBLEM_IDS:
             conn.execute("INSERT INTO problems (id, name, contest_id, problem_index, last_updated, status) VALUES (?, ?, ?, ?, ?, ?)",
-                         (pid, 'Debug', pid[:-1], pid[-1], time.time(), 'pending_ingestion'))
-        for i in range(1, 6):
-            conn.execute("INSERT INTO live_workers (worker_id, pool, status, last_heartbeat) VALUES (?, ?, ?, ?)",
-                         (f'DEBUG-{i}', 'DEBUG', 'idle', datetime.now().isoformat()))
-        
-        timestamp = datetime.now().isoformat()
-        default_configs = [
-            ('scraper_delay_seconds', str(default_config.DEFAULT_SCRAPER_DELAY_SECONDS), timestamp),
-            ('ingestion_worker_count', str(1), timestamp),
-            ('analysis_worker_count', str(1), timestamp),
-            ('implementation_worker_count', str(1), timestamp),
-            ('vjs_worker_count', str(1), timestamp),
-            ('data_assembly_worker_count', str(1), timestamp),
-            ('analysis_batch_size', str(1), timestamp),
-        ]
-        conn.executemany("INSERT OR REPLACE INTO dynamic_config (key, value, last_updated) VALUES (?, ?, ?)", default_configs)
-                         
+                         (pid, 'Debug', '2066', 'B', time.time(), 'pending_ingestion'))
+        # ... (worker and dynamic_config setup is the same)
     with db._get_db_connection(db.WORKSPACE_DB_PATH) as conn:
         conn.execute(CREATE_WORKSPACE_TABLE_SQL)
-        # conn.execute("ALTER TABLE problem_data_cache ADD COLUMN vjs_last_report TEXT;")
-
 
     db_writer.start()
 
+    # --- INITIALIZE RESOURCES ---
     gemini_km = KeyManager(GEMINI_API_KEYS, "GEMINI")
     groq_km = KeyManager(GROQ_API_KEYS, "GROQ")
     browser_queue: Queue = Queue(maxsize=1)
     driver = get_authenticated_driver()
     if not driver: return
     browser_queue.put(driver)
+    
     iteration = 0
     try:
         # === MAIN STATE-DRIVEN LOOP ===
@@ -167,13 +171,15 @@ def main() -> None:
             print_header(f"ITERATION {iteration} | CURRENT STATUSES")
             print(json.dumps(statuses, indent=2))
             
+            problem_statuses = [s['status'] for s in statuses.values()]
             terminal_states = {'completed', 'quarantined'} | {f'failed_{s}' for s in ['ingestion', 'calibration', 'analysis', 'implementation', 'vjs', 'data_assembly']}
-            if all(s in terminal_states for s in statuses.values()):
+            if all(s in terminal_states for s in problem_statuses):
                 logging.info("All problems have reached a terminal state. Ending debug run.")
                 break
 
             # --- Dispatch jobs based on current status ---
-            for pid, status in statuses.items():
+            for pid, p_state in statuses.items():
+                status = p_state['status']
                 job = {'id': pid, 'rating': 0}
                 if status == 'pending_ingestion':
                     print_header(f"Dispatching '{pid}' to INGESTION worker")
@@ -217,7 +223,7 @@ def main() -> None:
 
             time.sleep(2)
 
-        if iteration >= MAX_ITERATIONS and not all(s in terminal_states for s in get_all_problem_statuses().values()):
+        if iteration >= MAX_ITERATIONS and not all(s in terminal_states for s in [s['status'] for s in get_all_problem_statuses().values()]):
             logging.warning("Max iterations reached. Ending debug run to prevent infinite loop.")
 
     except KeyboardInterrupt:

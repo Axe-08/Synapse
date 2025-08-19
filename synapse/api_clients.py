@@ -26,14 +26,14 @@ GROQ_MODEL_NAME: str = "llama-3.3-70b-versatile"
 
 # --- Prompt Engineering ---
 GEMINI_ANALYST_BATCH_PROMPT: str = """
-You are an expert algorithm designer. Your task is to analyze a batch of C++ solutions for competitive programming problems and produce high-quality, language-agnostic pseudocode for each.
+You are an expert algorithm designer. Your task is to analyze a batch of C++ solutions for competitive programming problems and produce a single, canonical, high-quality, language-agnostic pseudocode for each.
 
 **RULES:**
-1.  You will be given a list of JSON objects. Each object contains a `problem_id`, the problem's `html_statement`, and the `reference_code`.
-2.  For each problem, you must analyze the context and the code to understand the core algorithm.
-3.  Your output **MUST** be a single JSON object (a dictionary) where the keys are the `problem_id`s from the input, and the values are the corresponding pseudocode strings.
-4.  The pseudocode must be clear, step-by-step, and language-agnostic. Do NOT use C++ specific syntax. Focus on logic, data structures, and key operations.
-5.  If a problem has feedback from a previous failed attempt (`vjs_report`), it will contain a detailed analysis of the failure. You MUST use this information to create a new, corrected algorithm. The feedback is your most important clue.
+1.  You will be given a list of JSON objects. Each object contains a `problem_id` and the problem's `html_statement`.
+2.  Crucially, each object also contains a `reference_solutions` key, which is a list of **multiple, trusted, and verified correct C++ solutions** for that problem.
+3.  Your primary goal is to **synthesize the core, most efficient, and most elegant algorithm** by analyzing all the provided reference solutions. Do not simply translate the first one you see. Identify the common patterns and best practices across the examples.
+4.  Your output **MUST** be a single JSON object (a dictionary) where the keys are the `problem_id`s from the input, and the values are the corresponding canonical pseudocode strings.
+5.  If a problem has feedback from a previous failed attempt (`vjs_report`), you MUST use this information to correct the core logic in your new pseudocode.
 6.  Ensure your final output is a valid JSON that can be parsed directly. Do not include any text or explanations outside of the final JSON object.
 
 **INPUT BATCH:**

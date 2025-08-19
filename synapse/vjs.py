@@ -37,17 +37,13 @@ def _truncate_text(text: str, max_len: int = 2000) -> str:
     """Truncates text to a max length, showing the start and end."""
     return text
 
-def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int, memory_limit_kb: int, suffix: str = "") -> Dict[str, Any]:
+def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int, memory_limit_kb: int, suffix: str = "", compile_only: bool = False) -> Dict[str, Any]:
     """
     Compiles and runs C++ code in a Docker sandbox, then uses a separate
     checker script to validate the output.
     (V5 - Verbose Failure Reporting)
     """
     logging.info(f"--- VJS START: Problem {problem_id}{suffix} ---")
-    if not pretests:
-        logging.warning(f"[{problem_id}] No pretests provided. Skipping VJS run.")
-        return {'status': 'SUCCESS', 'report': 'No pretests to run.', 'execution_time_ms': 0}
-
     dir_name = f"{problem_id}{suffix}"
     host_dir = os.path.join(os.getcwd(), "temp_vjs", dir_name)
     os.makedirs(host_dir, exist_ok=True)
@@ -66,6 +62,14 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
             logging.error(f"[{problem_id}] Compilation FAILED.")
             return {'status': 'COMPILE_ERROR', 'report': compile_proc.stderr[:2000]}
         logging.info(f"[{problem_id}] Compilation SUCCEEDED.")
+        
+        if compile_only:
+            # Return the path to the compiled binary for the calibration worker to use
+            executable_path = os.path.join(abs_host_dir, "main")
+            return {'status': 'SUCCESS', 'executable_path': executable_path}
+        if not pretests:
+            logging.warning(f"[{problem_id}] No pretests provided for full run. VJS complete.")
+            return {'status': 'SUCCESS', 'report': 'No pretests to run.', 'execution_time_ms': 0}
 
         # --- STAGE 2: Execution & Checking per Test Case ---
         total_execution_time_ms = 0
@@ -141,8 +145,8 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
         logging.info(f"--- VJS SUCCESS: All {len(pretests)} tests passed for {problem_id}{suffix} ---")
         return {'status': 'SUCCESS', 'report': f'All {len(pretests)} tests passed', 'execution_time_ms': total_execution_time_ms}
     finally:
-        if os.path.exists(host_dir): shutil.rmtree(host_dir)
-
+        if os.path.exists(host_dir) and not compile_only:
+            shutil.rmtree(host_dir)
 def run_static_analysis(code: str) -> Dict[str, Any]:
     """Runs cppcheck for static analysis on a C++ code string."""
     with tempfile.NamedTemporaryFile(mode='w+', suffix='.cpp', delete=False) as temp_f:

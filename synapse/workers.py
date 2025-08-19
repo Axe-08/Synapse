@@ -16,8 +16,8 @@ import logging
 import json
 import time
 from queue import Queue
-from typing import Dict, Any, List
-
+from typing import List, Optional, Dict, Any
+import os
 # Project-specific imports
 import synapse.database as db
 from synapse.scraper import get_authenticated_driver, fetch_problem_data, IPBanException
@@ -35,6 +35,25 @@ from config import (
 MAX_BROWSER_USES=25
 from .vjs import run_vjs, run_static_analysis, run_semantic_analysis
 from .data_assembly import _parse_memory_limit, _parse_time_limit
+import shutil
+import subprocess
+import tempfile
+
+
+def _voter(outputs: List[str]) -> Optional[str]:
+    """Determines the majority consensus from a list of outputs."""
+    if not outputs:
+        return None
+    # Count the occurrences of each unique output
+    counts = Counter(outputs)
+    # Find the most common output and its count
+    most_common, count = counts.most_common(1)[0]
+    # A true majority requires more than half the votes
+    if count > len(outputs) / 2:
+        return most_common
+    return None # Hung jury
+
+
 # --- STAGE 1: INGESTION & RE-SCRAPING ---
 def ingestion_worker(problem: Dict[str, Any], worker_id: str, browser_queue: Queue):
     """
@@ -74,6 +93,14 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: str, browser_queue: Que
         # Perform the scrape
         # db.update_worker_status(worker_id, 'INGESTION', problem_id, 'SCRAPING', 'active')
         scraped_data = fetch_problem_data(problem_id, driver, exclude_submission_ids=exclude_ids)
+        
+        html_statement = scraped_data['page_details']['problem_statement_html']
+        if "interaction protocol" in html_statement.lower() or "note that the program" in html_statement.lower():
+            reason = "Skipping interactive problem."
+            logging.warning(f"QUARANTINING {problem_id}: {reason}")
+            db.transition_to_quarantined(problem_id, reason)
+            return # Exit the worker cleanly
+
 
         if not scraped_data:
             reason = "Failed to find a new valid reference solution."
@@ -82,15 +109,12 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: str, browser_queue: Que
             raise Exception(reason)
 
         # Save data and transition state
-        # db.update_worker_status(worker_id, 'INGESTION', problem_id, 'SAVING', 'active')
-        db.save_ingestion_data_to_workspace(
+        # db.update_worker_status(worker_id, 'INGESTION', problem_id, 'SAVING', 'active')        
+        db.save_multi_oracle_ingestion_data(
             problem_id=problem_id,
-            html=scraped_data['page_details']['problem_statement_html'],
-            ref_solution_obj=scraped_data['ref_submission'],
-            ref_solution_code=scraped_data['solution_code'],
+            html=html_statement,
             pretests=scraped_data['pretests'],
-            time_limit_raw=scraped_data['page_details']['time_limit_raw'],
-            memory_limit_raw=scraped_data['page_details']['memory_limit_raw']
+            successful_solutions=scraped_data['successful_solutions']
         )
         if is_rescraping:
             db.reset_retry_counts(problem_id)
@@ -139,78 +163,93 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: str, browser_queue: Que
         db.update_worker_status(worker_id, 'INGESTION', None, None, 'idle')
 
 # --- NEW STAGE 2: CALIBRATION ---
-# --- STAGE 2: CALIBRATION ---
-# --- STAGE 2: CALIBRATION ---
 def calibration_worker(problem: Dict[str, Any], worker_id: str):
     """
-    Observes the ground-truth solution to deduce VJS rules (checker mode,
-    slowness factor) for this specific problem.
+    Compiles all N reference solutions ("oracles"), verifies a minimum number
+    are viable, and calculates a performance baseline (slowness_factor).
     """
     problem_id = problem['id']
     logging.info(f"[{problem_id}] Starting CALIBRATION stage...")
-    db.update_worker_status(worker_id, 'CALIBRATION', problem_id, 'VALIDATING', 'active')
+    db.update_worker_status(worker_id, 'CALIBRATION', problem_id, 'COMPILING_ORACLES', 'active')
+    
+    temp_dirs_to_clean = []
     try:
+        # 1. Fetch all oracle codes from the workspace
         workspace_data = db.get_batch_data_from_workspace([problem_id]).get(problem_id)
         if not workspace_data: raise Exception("Workspace data not found for calibration.")
 
-        reference_code = workspace_data.get('reference_solution_code')
-        all_pretests = json.loads(workspace_data.get('pretests_json', '[]'))
-        problem_time_limit_ms = _parse_time_limit(workspace_data.get('time_limit_raw', '1s'))
-        memory_limit_kb = _parse_memory_limit(workspace_data.get('memory_limit_raw', '256mb'))
-        ref_submission_obj = json.loads(workspace_data.get('reference_solution_json', '{}'))
-        official_ref_time_ms = ref_submission_obj.get('timeConsumedMillis', 500)
+        primary_code = workspace_data.get('reference_solution_code')
+        secondary_codes = json.loads(workspace_data.get('secondary_reference_codes_json', '[]'))
+        all_oracle_codes = [primary_code] + secondary_codes
 
-        # Apply a lenient time limit for the initial calibration run.
-        lenient_time_limit_ms = int(problem_time_limit_ms * INITIAL_CALIBRATION_TOLERANCE_FACTOR)
-
-        ref_vjs_result = run_vjs(
-            problem_id, reference_code, all_pretests, 
-            lenient_time_limit_ms, memory_limit_kb, suffix="_ref_calib"
-        )
-        
-        # FEATURE: Deduce rules based on the outcome for the ground-truth solution.
-        if ref_vjs_result['status'] == 'SUCCESS' or ref_vjs_result['status'] == 'PRESENTATION_ERROR':
-            # DEDUCE CHECKER MODE: If it passes with PE, it means a set-based check was successful.
-            checker_mode = 'strict' if ref_vjs_result['status'] == 'SUCCESS' else 'set_based'
-            logging.info(f"[{problem_id}] Calibration check passed. Deduced checker mode: {checker_mode}.")
+        # 2. Compile each oracle using the new compile_only flag
+        compiled_oracle_paths = []
+        for i, code in enumerate(all_oracle_codes):
+            if not code: continue
             
-            # CALCULATE SLOWNESS FACTOR
-            local_ref_time_ms = ref_vjs_result.get('execution_time_ms', official_ref_time_ms)
-            slowness_factor = 2.0
-            if official_ref_time_ms > 0 and local_ref_time_ms > 0:
-                slowness_factor = local_ref_time_ms / official_ref_time_ms
-            slowness_factor = max(1.0, min(slowness_factor, 10.0))
-
-            # SAVE VJS PROFILE
-            db.save_calibration_results(problem_id, all_pretests, slowness_factor, checker_mode)
-            db.transition_to_pending_analysis(problem_id)
-            logging.info(f"[{problem_id}] Calibration SUCCEEDED. Slowness factor: {slowness_factor:.2f}. -> pending_analysis")
-        else:
-            # UNRECOVERABLE FAILURE: The reference solution is either too slow even with leniency,
-            # or it's brittle (RE/WA). It is unsuitable for analysis.
-            detailed_report = ref_vjs_result.get('report', 'No detailed report available.')
-            logging.error(f"[{problem_id}] CALIBRATION FAILED. VJS Status: {ref_vjs_result['status']}")
-            logging.error(f"--- VJS CALIBRATION FAILURE REPORT FOR {problem_id} ---\n{detailed_report}\n----------------------------------------------------")
+            # Use a unique suffix for each oracle's VJS run
+            vjs_suffix = f"_oracle_{i}"
             
-            # 2. Save the report to the database so our debug script can see it
-            with db._get_db_connection(db.WORKSPACE_DB_PATH) as conn:
-                conn.execute("UPDATE problem_data_cache SET vjs_last_report = ? WHERE problem_id = ?",
-                             (detailed_report, problem_id))
-
-            with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
-                cursor = conn.execute("SELECT rescraping_attempts FROM problems WHERE id = ?", (problem_id,))
-                rescrapes = cursor.fetchone()[0]
+            # The time/memory limits don't matter for compile_only, but the function requires them
+            result = run_vjs(problem_id, code, [], 1000, 262144, suffix=vjs_suffix, compile_only=True)
             
-            if rescrapes < MAX_RESCRAPING_ATTEMPTS:
-                logging.info(f"[{problem_id}] Reference solution is unsuitable. Triggering re-scrape attempt {rescrapes + 1}/{MAX_RESCRAPING_ATTEMPTS}.")
-                db.transition_to_pending_rescraping(problem_id, str(ref_submission_obj.get('id', 'unknown')))
+            if result['status'] == 'SUCCESS':
+                compiled_oracle_paths.append(result['executable_path'])
+                # Keep track of the temp directory VJS created so we can clean it up
+                temp_dirs_to_clean.append(os.path.dirname(result['executable_path']))
             else:
-                reason = f"Calibration FAILED after {MAX_RESCRAPING_ATTEMPTS} attempts to find a suitable reference. Last failure: {ref_vjs_result['status']}"
-                db.transition_to_quarantined(problem_id, reason)
+                logging.warning(f"[{problem_id}] Oracle {i} failed to compile.")
+
+        # 3. Check if we have a quorum of viable oracles
+        successful_oracles_count = len(compiled_oracle_paths)
+        logging.info(f"[{problem_id}] Successfully compiled {successful_oracles_count}/{len(all_oracle_codes)} oracles.")
+        
+        if successful_oracles_count < MIN_VIABLE_ORACLES:
+            reason = f"Failed to compile minimum number of oracles. Needed {MIN_VIABLE_ORACLES}, got {successful_oracles_count}."
+            db.transition_to_quarantined(problem_id, reason)
+            return
+
+        # 4. If quorum is met, run the primary oracle to get slowness factor and validate pretests
+        db.update_worker_status(worker_id, 'CALIBRATION', problem_id, 'CALCULATING_SLOWNESS', 'active')
+        
+        # This is a full VJS run, not compile_only
+        # We use the primary oracle's code, not its pre-compiled binary for simplicity
+        pretests = json.loads(workspace_data.get('pretests_json', '[]'))
+        time_limit_ms = _parse_time_limit(workspace_data.get('time_limit_raw', '1s'))
+        memory_limit_kb = _parse_memory_limit(workspace_data.get('memory_limit_raw', '256mb'))
+        
+        calib_run_result = run_vjs(problem_id, primary_code, pretests, int(time_limit_ms * 2), memory_limit_kb, suffix="_calib_run")
+        
+        if calib_run_result['status'] not in ['SUCCESS', 'PRESENTATION_ERROR']:
+            raise Exception(f"Primary oracle failed full run during calibration: {calib_run_result['status']}")
+
+        # 5. Calculate slowness factor and determine checker mode
+        ref_submission = json.loads(workspace_data.get('reference_solution_json', '{}'))
+        official_time_ms = ref_submission.get('timeConsumedMillis', 500)
+        local_time_ms = calib_run_result.get('execution_time_ms', official_time_ms)
+        slowness_factor = max(1.0, local_time_ms / official_time_ms if official_time_ms > 0 else 2.0)
+        checker_mode = 'set_based' if calib_run_result['status'] == 'PRESENTATION_ERROR' else 'strict'
+
+        # 6. Save results to the database and transition
+        db.save_calibration_results(
+            problem_id, 
+            successful_oracles_count,
+            compiled_oracle_paths, 
+            pretests, # The pretests are now "validated" by the primary oracle
+            slowness_factor, 
+            checker_mode
+        )
+        db.transition_to_pending_analysis(problem_id)
+        logging.info(f"[{problem_id}] Calibration SUCCEEDED. Oracles: {successful_oracles_count}. Slowness: {slowness_factor:.2f}x. -> pending_analysis")
+
     except Exception as e:
         logging.error(f"FAILED [Calibration] for {problem_id}: {e}", exc_info=False)
         db.transition_to_failed(problem_id, 'calibration', str(e))
     finally:
+        # Clean up all the directories left by the compile_only runs
+        for d in temp_dirs_to_clean:
+            if os.path.exists(d):
+                shutil.rmtree(d)
         db.update_worker_status(worker_id, 'CALIBRATION', None, None, 'idle')
        
        
@@ -218,31 +257,29 @@ def calibration_worker(problem: Dict[str, Any], worker_id: str):
 def analysis_worker(batch: List[Dict[str, Any]], worker_id: str, gemini_km: KeyManager):
     """
     Processes a batch of problems, sending them to the Gemini "Analyst" LLM
-    to generate pseudocode. It also handles the logic for quarantining or
-    triggering re-scraping for problems that have failed too many times.
-    Args:
-        batch: A list of problem dictionaries to process.
-        worker_id: The ID of this worker thread.
-        gemini_km: The KeyManager for Gemini API keys.
+    with multiple reference solutions to synthesize a canonical pseudocode.
     """
     batch_ids = [p['id'] for p in batch]
-    # BUGFIX: Clarified logging
     logging.info(f"Starting analysis for batch of {len(batch_ids)}: {batch_ids}")
     start_time = time.perf_counter()
+    problem_ids_in_api_call = [] # Define here for wider scope
     try:
-        valid_batch_for_api = []
+        # --- 1. PRE-FLIGHT CHECKS (Handles retries and quarantines) ---
+        problems_to_process = []
         batch_ids_to_query = [p['id'] for p in batch]
-        # Pre-fetch states and workspace data to perform checks
+        
         with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
             placeholders = ','.join('?' for _ in batch_ids_to_query)
             cursor = conn.execute(f"SELECT id, analysis_try_count, rescraping_attempts FROM problems WHERE id IN ({placeholders})", batch_ids_to_query)
             problem_states = {row[0]: {'analysis_tries': row[1], 'rescrapes': row[2]} for row in cursor.fetchall()}
+        
         workspace_data = db.get_batch_data_from_workspace(batch_ids_to_query)
-        # Filter the batch, applying quarantine/re-scrape logic
+
         for problem in batch:
             p_id = problem['id']
             state = problem_states.get(p_id)
             if not state: continue
+            
             if state['analysis_tries'] >= MAX_ANALYSIS_RETRIES:
                 if state['rescrapes'] >= MAX_RESCRAPING_ATTEMPTS:
                     reason = f"Exceeded max analysis retries ({MAX_ANALYSIS_RETRIES}) and re-scraping attempts ({MAX_RESCRAPING_ATTEMPTS})."
@@ -252,29 +289,57 @@ def analysis_worker(batch: List[Dict[str, Any]], worker_id: str, gemini_km: KeyM
                     failed_sub_id = json.loads(ref_sol_json).get('id', 'unknown')
                     db.transition_to_pending_rescraping(p_id, str(failed_sub_id))
             elif p_id in workspace_data:
-                p_data = workspace_data[p_id]
-                valid_batch_for_api.append({
-                    "problem_id": p_id,
-                    "html_statement": p_data.get('problem_statement_html'),
-                    "reference_code": p_data.get('reference_solution_code'),
-                    "vjs_report": p_data.get('vjs_last_report')
-                })
-        if not valid_batch_for_api:
+                problems_to_process.append(problem)
+
+        if not problems_to_process:
             logging.info("Batch is empty after pre-flight checks.")
             return
-        # Call API and update database
-        problem_ids_in_api_call = [p['problem_id'] for p in valid_batch_for_api]
+
+        # --- 2. NEW: CONSTRUCT THE MULTI-ORACLE API PAYLOAD ---
+        final_api_batch = []
+        problem_ids_in_api_call = [p['id'] for p in problems_to_process]
+        
+        for p_info in problems_to_process:
+            p_id = p_info['id']
+            p_data = workspace_data.get(p_id)
+            if not p_data: continue
+
+            primary_code = p_data.get('reference_solution_code')
+            secondary_codes = json.loads(p_data.get('secondary_reference_codes_json', '[]'))
+            
+            all_codes = [primary_code] + secondary_codes
+            all_codes = [code for code in all_codes if code] # Filter out potential None or empty strings
+
+            if not all_codes:
+                logging.warning(f"No reference codes found in workspace for {p_id}, removing from this batch.")
+                problem_ids_in_api_call.remove(p_id)
+                continue
+
+            final_api_batch.append({
+                "problem_id": p_id,
+                "html_statement": p_data.get('problem_statement_html'),
+                "reference_solutions": all_codes, # Key change: Pass the list of all oracle codes
+                "vjs_report": p_data.get('vjs_last_report')
+            })
+
+        if not final_api_batch:
+            logging.warning("API batch is empty after processing workspace data.")
+            return
+
+        # --- 3. API CALL AND DATABASE UPDATE ---
         db.update_worker_status(worker_id, 'ANALYSIS', ','.join(problem_ids_in_api_call), 'API_CALL', 'active')
-        pseudocode_results = call_gemini_analyst_batch(valid_batch_for_api, gemini_km)
+        pseudocode_results = call_gemini_analyst_batch(final_api_batch, gemini_km)
         db.update_worker_status(worker_id, 'ANALYSIS', ','.join(pseudocode_results.keys()), 'UPDATING_DB', 'active')
+        
         for problem_id, pseudocode in pseudocode_results.items():
             db.update_workspace_with_analysis_results(problem_id, pseudocode)
+            
         db.transition_batch_to_pending_implementation(list(pseudocode_results.keys()))
         logging.info(f"SUCCESS [Analysis] for {len(pseudocode_results)} problems. -> pending_implementation")
+
     except Exception as e:
         logging.error(f"FAILED [Analysis] for batch {batch_ids}: {e}", exc_info=False)
-        # Only fail problems that were actually part of the API call attempt
-        if 'problem_ids_in_api_call' in locals():
+        if problem_ids_in_api_call:
             for problem_id in problem_ids_in_api_call:
                 db.transition_to_failed(problem_id, 'analysis', str(e))
     finally:
@@ -282,7 +347,6 @@ def analysis_worker(batch: List[Dict[str, Any]], worker_id: str, gemini_km: KeyM
         success = 'e' not in locals() or locals()['e'] is None
         db.log_metric('ANALYSIS', 'analysis_batch_task', duration_ms, success, {'batch_size': len(batch_ids)})
         db.update_worker_status(worker_id, 'ANALYSIS', None, None, 'idle')
-
 # --- STAGE 3: IMPLEMENTATION ---
 def implementation_worker(problem: Dict[str, Any], worker_id: int, groq_km: KeyManager):
     """
@@ -335,68 +399,117 @@ def implementation_worker(problem: Dict[str, Any], worker_id: int, groq_km: KeyM
         db.update_worker_status(worker_id, 'IMPLEMENTATION', None, None, 'idle')
 
 # --- STAGE 4: VJS (Verification & Judging Service) ---
-
 def vjs_worker(problem: Dict[str, Any], worker_id: str):
     """
-    Judges the AI-generated code using the VJS Profile determined
-    during the calibration stage.
+    Judges the AI-generated code using N-Version Differential VJS.
+    It runs N compiled oracles to generate a consensus ground truth for each
+    test case and judges the AI's solution against that dynamic truth.
     """
     problem_id = problem['id']
-    logging.info(f"[{problem_id}] Starting VJS stage for generated code...")
-    db.update_worker_status(worker_id, 'VJS', problem_id, 'JUDGING', 'active')
+    logging.info(f"[{problem_id}] Starting N-Version Differential VJS...")
+    db.update_worker_status(worker_id, 'VJS', problem_id, 'SETUP', 'active')
+
+    ai_executable_path = None
     try:
+        # 1. Fetch all calibration data from the workspace
         workspace_data = db.get_batch_data_from_workspace([problem_id]).get(problem_id)
         if not workspace_data: raise Exception("Workspace data not found for VJS.")
 
-        # Load the VJS Profile from the calibration stage
         reconstructed_code = workspace_data.get('arl_reconstructed_code')
-        validated_pretests = json.loads(workspace_data.get('validated_pretests_json', '[]'))
+        oracle_paths = json.loads(workspace_data.get('compiled_oracle_paths_json', '[]'))
+        pretests = json.loads(workspace_data.get('validated_pretests_json', '[]'))
         slowness_factor = workspace_data.get('slowness_factor', 2.0)
-        checker_mode = workspace_data.get('checker_mode', 'strict') # Default to strict
-        
-        problem_time_limit_ms = _parse_time_limit(workspace_data.get('time_limit_raw', '1s'))
+        time_limit_ms = int(_parse_time_limit(workspace_data.get('time_limit_raw', '1s')) * slowness_factor)
         memory_limit_kb = _parse_memory_limit(workspace_data.get('memory_limit_raw', '256mb'))
-        
-        if not all([reconstructed_code, validated_pretests]):
-            raise Exception("Missing required data for VJS (reconstructed code or validated pretests).")
-            
-        adjusted_time_limit_ms = int(problem_time_limit_ms * slowness_factor)
-        vjs_result = run_vjs(problem_id, reconstructed_code, validated_pretests, adjusted_time_limit_ms, memory_limit_kb, suffix="_arl")
-        
-        # FEATURE: Interpret the verdict using the calibrated checker mode.
-        final_status = vjs_result['status']
-        if checker_mode == 'set_based' and final_status == 'PRESENTATION_ERROR':
-            logging.info(f"[{problem_id}] PE verdict promoted to SUCCESS based on set-based checker calibration.")
-            final_status = 'SUCCESS'
 
-        logging.info(f"[{problem_id}] Final VJS verdict: {final_status}")
-        report_for_llm = vjs_result.get('report', '')
+        if not all([reconstructed_code, oracle_paths, pretests]):
+            raise Exception("Missing critical data for VJS (code, oracles, or pretests).")
 
-        if final_status == 'SUCCESS':
-            db.update_worker_status(worker_id, 'VJS', problem_id, 'ANALYZING', 'active')
-            reference_code = workspace_data.get('reference_solution_code')
-            analysis = {'reference_analysis': {}, 'reconstructed_analysis': {}}
-            if reference_code:
-                analysis['reference_analysis'] = {'cppcheck': run_static_analysis(reference_code), 'semantic': run_semantic_analysis(reference_code)}
-            analysis['reconstructed_analysis'] = {'cppcheck': run_static_analysis(reconstructed_code), 'semantic': run_semantic_analysis(reconstructed_code)}
-            db.update_workspace_with_quality_analysis(problem_id, json.dumps(analysis))
-            db.transition_to_pending_data_assembly(problem_id)
+        # 2. Compile the AI's solution
+        db.update_worker_status(worker_id, 'VJS', problem_id, 'COMPILING_AI', 'active')
+        compile_result = run_vjs(problem_id, reconstructed_code, [], 1000, 262144, suffix="_ai_compile", compile_only=True)
+        if compile_result['status'] != 'SUCCESS':
+            db.transition_to_pending_implementation_retry(problem_id, compile_result.get('report', ''))
+            return
 
-        elif final_status == 'COMPILE_ERROR':
-            db.transition_to_pending_implementation_retry(problem_id, report_for_llm)
-        elif final_status in ['TIME_LIMIT_EXCEEDED', 'WRONG_ANSWER', 'RUNTIME_ERROR', 'PRESENTATION_ERROR']:
-            db.transition_to_pending_analysis_retry(problem_id, report_for_llm)
-        else:
-            raise Exception(f"VJS system error: {report_for_llm}")
+        ai_executable_path = compile_result['executable_path']
+        ai_executable_dir = os.path.dirname(ai_executable_path)
 
-        if final_status != 'SUCCESS':
-            with db._get_db_connection(db.WORKSPACE_DB_PATH) as conn:
-                conn.execute("UPDATE problem_data_cache SET vjs_last_report = ? WHERE problem_id = ?", (report_for_llm, problem_id))
+        # 3. Iterate through each pretest and perform differential verification
+        for i, test in enumerate(pretests):
+            test_num_str = f"Test {i+1}/{len(pretests)}"
+            db.update_worker_status(worker_id, 'VJS', problem_id, f'RUNNING {test_num_str}', 'active')
+
+            # A. Run all oracles in parallel to get their outputs
+            # This is I/O bound (waiting for subprocesses), so threading is perfect.
+            oracle_outputs = []
+            with ThreadPoolExecutor(max_workers=len(oracle_paths)) as executor:
+                # Docker command to run a pre-compiled binary
+                def run_binary(exec_path, test_input):
+                    host_dir = os.path.dirname(exec_path)
+                    exec_name = os.path.basename(exec_path)
+                    # We assume the input is small enough to be passed via stdin pipe
+                    run_cmd = ["docker", "run", "--rm", "-i", f"--memory={memory_limit_kb}k", "-v", f"{host_dir}:/app:ro", "-w", "/app", "synapse-judge", "timeout", str(time_limit_ms/1000 + 1), f"./{exec_name}"]
+                    proc = subprocess.run(run_cmd, input=test_input, capture_output=True, text=True, timeout=time_limit_ms/1000 + 5)
+                    if proc.returncode != 0: return f"RUNTIME_ERROR_OR_TLE_{proc.returncode}"
+                    return proc.stdout.strip().replace('\r\n', '\n')
+
+                futures = {executor.submit(run_binary, path, test['input']): path for path in oracle_paths}
+                for future in as_completed(futures):
+                    oracle_outputs.append(future.result())
+
+            # B. Vote to find the consensus ground truth
+            consensus_output = _voter(oracle_outputs)
+
+            # C. Handle a "Hung Jury"
+            if consensus_output is None:
+                reason = f"Hung Jury on {test_num_str}. Oracle outputs: {oracle_outputs}"
+                db.transition_to_quarantined(problem_id, reason)
+                return
+
+            # D. Run the AI's solution
+            ai_output = run_binary(ai_executable_path, test['input'])
+
+            # E. Compare AI output to the consensus truth using our checker
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.in') as f_in, \
+                 tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.ans') as f_ans, \
+                 tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.out') as f_out:
+
+                f_in.write(test['input'])
+                f_ans.write(consensus_output)
+                f_out.write(ai_output)
+
+                in_path, ans_path, out_path = f_in.name, f_ans.name, f_out.name
+
+            checker_cmd = ["python", "-m", "synapse.checker", in_path, out_path, ans_path]
+            checker_proc = subprocess.run(checker_cmd, capture_output=True, text=True)
+
+            os.remove(in_path); os.remove(ans_path); os.remove(out_path)
+
+            # F. Handle failure
+            if checker_proc.returncode != 0: # 0 is ACCEPTED
+                verdict = "WA" if checker_proc.returncode == 1 else "PE"
+                report = (
+                    f"{verdict} on {test_num_str} vs Oracle Consensus.\n"
+                    f"Checker Msg: {checker_proc.stdout.strip()}\n"
+                    f"--- INPUT ---\n{test['input'][:1000]}\n"
+                    f"--- ORACLE CONSENSUS ---\n{consensus_output[:1000]}\n"
+                    f"--- AI OUTPUT ---\n{ai_output[:1000]}"
+                )
+                db.transition_to_pending_analysis_retry(problem_id, report)
+                return
+
+        # 4. If all tests pass, the problem is verified!
+        db.update_problem_status(problem_id, None, extra_updates={'confidence_level': 2})
+        db.transition_to_pending_data_assembly(problem_id)
+        logging.info(f"SUCCESS [VJS] for {problem_id}. All {len(pretests)} tests passed by consensus. -> pending_data_assembly")
 
     except Exception as e:
-        logging.error(f"FAILED [VJS] for {problem_id}: {e}", exc_info=False)
+        logging.error(f"FAILED [VJS] for {problem_id}: {e}", exc_info=True)
         db.transition_to_failed(problem_id, 'vjs', str(e))
     finally:
+        if ai_executable_path and os.path.exists(os.path.dirname(ai_executable_path)):
+            shutil.rmtree(os.path.dirname(ai_executable_path))
         db.update_worker_status(worker_id, 'VJS', None, None, 'idle')
 
     # --- STAGE 5: DATA ASSEMBLY ---

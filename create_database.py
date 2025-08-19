@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS problems (
     implementation_try_count INTEGER DEFAULT 0,
     rescraping_attempts INTEGER DEFAULT 0,
     tried_submission_ids TEXT,
+    reference_submissions_json TEXT,     -- ADD: Stores the JSON array of N submission objects.
+    successful_oracles INTEGER DEFAULT 0,  -- ADD: Caches the count of compiled oracles.
+    confidence_level INTEGER DEFAULT 0,    -- ADD: 0=pending, 1=calibrated, 2=differentially verified
     last_vjs_report TEXT,
     notes TEXT,
     last_updated TEXT NOT NULL
@@ -105,19 +108,19 @@ CREATE_WORKSPACE_TABLE_SQL: str = """
 CREATE TABLE IF NOT EXISTS problem_data_cache (
     problem_id TEXT PRIMARY KEY,
     problem_statement_html TEXT,
-    reference_solution_json TEXT, -- The full submission object
-    reference_solution_code TEXT, -- Just the raw code
+    reference_solution_json TEXT,          -- Metadata for the primary (highest-rated) oracle.
+    reference_solution_code TEXT,          -- Source code for the primary oracle.
+    secondary_reference_codes_json TEXT, -- ADD: JSON array of codes for oracles 2 through N.
+    compiled_oracle_paths_json TEXT,     -- ADD: Stores paths to compiled binaries for the VJS worker.
     pretests_json TEXT,
+    validated_pretests_json TEXT,        -- ADD: Stores pretests verified during calibration.
+    slowness_factor REAL,                  -- ADD: Stores the calculated local vs. official judge speed ratio.
+    checker_mode TEXT,                     -- ADD: Stores 'strict' or 'set_based' validation rule.
     arl_pseudocode TEXT,
     arl_reconstructed_code TEXT,
     arl_feedback TEXT,
     vjs_last_report TEXT,
-    quality_analysis_json TEXT, -- To store cppcheck, CC, MI results
-    time_limit_raw TEXT,
-    memory_limit_raw TEXT,
-    validated_pretests_json TEXT,
-    slowness_factor REAL,
-    checker_mode TEXT -- FEATURE: 'strict' or 'set_based'
+    quality_analysis_json TEXT
 );
 """
 
