@@ -74,7 +74,7 @@ class ConfigManager:
                     for key, value in cursor.fetchall():
                         # Try to cast to int, otherwise keep as string
                         try:
-                            self._config_cache[key] = int(value)
+                            self._config_cache[key] = float(value)
                         except ValueError:
                             self._config_cache[key] = value
             except sqlite3.Error as e:

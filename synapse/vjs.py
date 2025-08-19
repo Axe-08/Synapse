@@ -33,12 +33,9 @@ ACCEPTED = 0
 WRONG_ANSWER = 1
 PRESENTATION_ERROR = 2
 
-def _truncate_text(text: str, max_len: int = 512) -> str:
+def _truncate_text(text: str, max_len: int = 2000) -> str:
     """Truncates text to a max length, showing the start and end."""
-    if len(text) <= max_len:
-        return text
-    half_len = (max_len - 20) // 2 # leave space for ellipsis
-    return f"{text[:half_len]}\n... (truncated) ...\n{text[-half_len:]}"
+    return text
 
 def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int, memory_limit_kb: int, suffix: str = "") -> Dict[str, Any]:
     """
@@ -99,7 +96,11 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
             if run_proc.returncode == 124:
                 report = f"TLE on {test_num_str}.\n\n--- INPUT ---\n{_truncate_text(test['input'])}"
                 return {'status': 'TIME_LIMIT_EXCEEDED', 'report': report}
-            if run_proc.returncode in [136, 137, 139]:
+                        # ADD THIS BLOCK
+            if run_proc.returncode == 137:
+                report = f"MLE on {test_num_str} (Potential Memory Limit Exceeded, exit code 137).\n\n--- INPUT ---\n{_truncate_text(test['input'])}"
+                return {'status': 'MEMORY_LIMIT_EXCEEDED', 'report': report}
+            if run_proc.returncode in [136, 139]:
                 report = f"RE on {test_num_str} (signal {run_proc.returncode - 128}).\n\n--- INPUT ---\n{_truncate_text(test['input'])}"
                 return {'status': 'RUNTIME_ERROR', 'report': report}
             if run_proc.returncode != 0:

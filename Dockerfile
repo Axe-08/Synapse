@@ -1,7 +1,7 @@
 # Dockerfile for the Synapse Judge Environment
 
 # Base image with GCC 12, which fully supports C++17, C++20, and C++23 standards.
-FROM gcc:12
+FROM gcc:15
 
 # Update package lists and install necessary command-line utilities.
 # - coreutils: Provides the 'timeout' command for enforcing time limits on execution.

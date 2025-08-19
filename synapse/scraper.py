@@ -58,6 +58,24 @@ SUBMISSION_URL_TEMPLATE = "https://codeforces.com/contest/{contestId}/submission
 INTERNAL_API_BASE = "https://codeforces.com/data"
 
 
+def _parse_pre_tag(pre_tag):
+    """
+    Parses the content of a <pre> tag, intelligently handling both
+    plain text and the newer div-based line-by-line format.
+    """
+    text = ""
+    if not pre_tag:
+        return ""
+    
+    line_divs = pre_tag.find_all('div', class_='test-example-line')
+    if line_divs:
+        text = '\n'.join(div.text for div in line_divs)
+    else:
+        text = '\n'.join(line for line in pre_tag.stripped_strings)
+    
+    # Normalize Windows-style newlines to Linux-style
+    return text.replace('\r\n', '\n').strip()
+
 def fetch_problem_page_details(contest_id: int, problem_index: str) -> dict:
     """
     Scrapes the public problem page for statement, metadata, and example pretests.
@@ -338,13 +356,21 @@ def fetch_problem_data(problem_id: str, driver: uc.Chrome, exclude_submission_id
             for i in range(1, int(data.get('testCount', 0)) + 1):
                 input_data, answer_data = data.get(f'input#{i}'), data.get(f'answer#{i}')
                 if input_data is not None and answer_data is not None:
-                    api_pretests.append({'input': input_data.strip(), 'output': answer_data.strip()})
-
-            if len(api_pretests) > len(pretests):
+                    clean_input = input_data.replace('\r\n', '\n').strip()
+                    clean_output = answer_data.replace('\r\n', '\n').strip()
+                    api_pretests.append({'input': clean_input, 'output': clean_output})
+            # --- CORRECTED LOGIC ---
+            # If the API returned any tests, it is the definitive source.
+            if api_pretests:
                 pretests = api_pretests
-                logging.info(f"[{problem_id}] SUCCESS: Enriched to {len(pretests)} total pretests.")
+                logging.info(f"[{problem_id}] SUCCESS: Replaced example tests with {len(pretests)} full pretests from API.")
+            else:
+                logging.warning(f"[{problem_id}] API enrichment returned no pretests. Falling back to {len(pretests)} examples scraped from HTML.")
+            # --- END CORRECTION ---
+
         except Exception as e:
             logging.warning(f"[{problem_id}] Internal API call for pretests failed: {e}")
+
 
     # Step 5: Assemble and return
     return {

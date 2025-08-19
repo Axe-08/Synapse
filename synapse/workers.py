@@ -104,6 +104,9 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: str, browser_queue: Que
         # Revert the status so it can be picked up again after the ban lifts
         db.transition_to_failed(problem_id, 'ingestion', 'IP_BAN_DETECTED')
     except Exception as e:
+        import traceback
+        logging.error(f"Full traceback for ingestion failure on {problem_id}:")
+        traceback.print_exc()
         if "Failed to find a new" not in str(e):
             logging.error(f"FAILED [Ingestion] for {problem_id}: {e}", exc_info=False)
             db.transition_to_failed(problem_id, 'ingestion', str(e))
@@ -186,12 +189,14 @@ def calibration_worker(problem: Dict[str, Any], worker_id: str):
             # UNRECOVERABLE FAILURE: The reference solution is either too slow even with leniency,
             # or it's brittle (RE/WA). It is unsuitable for analysis.
             detailed_report = ref_vjs_result.get('report', 'No detailed report available.')
-            logging.warning(
-                f"[{problem_id}] Calibration FAILED with status {ref_vjs_result['status']}.\n"
-                f"--- VJS CALIBRATION REPORT ---\n"
-                f"{detailed_report}"
-            )
+            logging.error(f"[{problem_id}] CALIBRATION FAILED. VJS Status: {ref_vjs_result['status']}")
+            logging.error(f"--- VJS CALIBRATION FAILURE REPORT FOR {problem_id} ---\n{detailed_report}\n----------------------------------------------------")
             
+            # 2. Save the report to the database so our debug script can see it
+            with db._get_db_connection(db.WORKSPACE_DB_PATH) as conn:
+                conn.execute("UPDATE problem_data_cache SET vjs_last_report = ? WHERE problem_id = ?",
+                             (detailed_report, problem_id))
+
             with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
                 cursor = conn.execute("SELECT rescraping_attempts FROM problems WHERE id = ?", (problem_id,))
                 rescrapes = cursor.fetchone()[0]
