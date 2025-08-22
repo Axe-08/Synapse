@@ -120,7 +120,9 @@ CREATE TABLE IF NOT EXISTS problem_data_cache (
     arl_reconstructed_code TEXT,
     arl_feedback TEXT,
     vjs_last_report TEXT,
-    quality_analysis_json TEXT
+    quality_analysis_json TEXT,
+    time_limit_raw TEXT,                -- ADD THIS LINE
+    memory_limit_raw TEXT               -- ADD THIS LINE
 );
 """
 

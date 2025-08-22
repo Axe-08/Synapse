@@ -11,8 +11,8 @@ managed here for easy tuning.
 import logging
 import time
 import json
-from typing import List, Dict, Any
-
+from typing import List, Dict, Any, Tuple
+import re # Make sure 're' is imported
 import google.generativeai as genai
 from groq import Groq, RateLimitError
 
@@ -25,24 +25,55 @@ GEMINI_MODEL_NAME: str = 'gemini-2.5-pro' # Updated to latest stable model
 GROQ_MODEL_NAME: str = "llama-3.3-70b-versatile"
 
 # --- Prompt Engineering ---
+# In synapse/api_clients.py
 GEMINI_ANALYST_BATCH_PROMPT: str = """
-You are an expert algorithm designer. Your task is to analyze a batch of C++ solutions for competitive programming problems and produce a single, canonical, high-quality, language-agnostic pseudocode for each.
+You are an expert algorithm designer. Your primary goal is to analyze multiple C++ solutions for each problem in a batch and synthesize a single, canonical pseudocode.
 
-**RULES:**
-1.  You will be given a list of JSON objects. Each object contains a `problem_id` and the problem's `html_statement`.
-2.  Crucially, each object also contains a `reference_solutions` key, which is a list of **multiple, trusted, and verified correct C++ solutions** for that problem.
-3.  Your primary goal is to **synthesize the core, most efficient, and most elegant algorithm** by analyzing all the provided reference solutions. Do not simply translate the first one you see. Identify the common patterns and best practices across the examples.
-4.  Your output **MUST** be a single JSON object (a dictionary) where the keys are the `problem_id`s from the input, and the values are the corresponding canonical pseudocode strings.
-5.  If a problem has feedback from a previous failed attempt (`vjs_report`), you MUST use this information to correct the core logic in your new pseudocode.
-6.  Ensure your final output is a valid JSON that can be parsed directly. Do not include any text or explanations outside of the final JSON object.
+**INPUT:**
+You will receive a list of JSON objects. Each object represents a single problem and contains:
+1.  `problem_id`: A unique identifier.
+2.  `html_statement`: The full problem description.
+3.  `reference_solutions`: A list of verified, correct C++ solutions. These may vary in style and include boilerplate or macros.
 
-**INPUT BATCH:**
+**OUTPUT RULES:**
+YOU MUST follow this output structure precisely. Use the exact markdown headings.
+
+1.  **`## REASONING` Section:**
+    - Create a sub-heading for each problem (e.g., `### Problem 123A`).
+    - Under each sub-heading, explain your chain of thought: Analyze the solutions (ignoring boilerplate), compare the approaches, select the best one, and formulate your pseudocode plan.
+
+2.  **`## FINAL JSON` Section:**
+    - This section must contain ONLY a single JSON object inside a markdown code block.
+    - This JSON object must contain entries for all problems you successfully processed.
+
+3.  **Handling Failures:**
+    - If you cannot process a problem, explain why in its `### Problem ID` subsection within the `## REASONING` section.
+    - Omit any failed problems from the final JSON object.
+
+---
+**EXAMPLE OUTPUT:**
+
+## REASONING
+
+### Problem 123A
+Analysis: The solutions use a simple two-pointer approach.
+Comparison: All solutions are fundamentally the same.
+Selection: The two-pointer method is optimal.
+Formulation: I will write pseudocode that initializes two pointers, left and right, and moves them inwards based on a condition.
+
+### Problem 456B
+Analysis: I was unable to process this problem because the provided solutions were too contradictory and a single canonical algorithm could not be determined. I will omit it from the final JSON.
+
+## FINAL JSON
+```json
+{{
+  "123A": "1. Initialize left_ptr = 0, right_ptr = n-1\\n2. While left_ptr < right_ptr:\\n   ..."
+}}
+```
+---
+INPUT BATCH:
 {batch_input_json}
-
-
-**OUTPUT JSON:**
 """
-
 GROQ_IMPLEMENTER_PROMPT: str = """
 You are a world-class competitive programmer. Your task is to implement a solution in C++ based *only* on the provided problem context and pseudocode.
 
@@ -65,6 +96,33 @@ This section contains feedback from the automated judge on your last attempt. Ig
 
 **C++ SOLUTION:**
 """
+
+class AnalysisFailedException(Exception):
+    """Custom exception for when the LLM provides a failure analysis."""
+    pass
+
+def _preprocess_code_for_llm(code: str) -> str:
+    """
+    Strips common boilerplate and comments from C++ code to focus 
+    the LLM on the core algorithm.
+    """
+    # 1. Remove multi-line comments (/* ... */)
+    code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+    # 2. Remove single-line comments (// ...)
+    code = re.sub(r'//.*', '', code)
+    # 3. Remove includes, using namespace, and common fast I/O setup
+    lines = code.split('\n')
+    processed_lines = []
+    for line in lines:
+        stripped_line = line.strip()
+        if stripped_line.startswith(('#include', 'using namespace', 'ios_base::sync_with_stdio', 'cin.tie')):
+            continue
+        # Remove empty lines that might result from comment removal
+        if stripped_line:
+            processed_lines.append(line)
+    return '\n'.join(processed_lines)
+# In synapse/api_clients.py
+
 def _sanitize_cpp_code(raw_output: str) -> str:
     """
     Strips Markdown code blocks and any surrounding text from the LLM output.
@@ -82,19 +140,11 @@ def _sanitize_cpp_code(raw_output: str) -> str:
 
     return raw_output.strip()
 
-def call_gemini_analyst_batch(batch_data: List[Dict[str, Any]], key_manager: KeyManager) -> Dict[str, str]:
+def call_gemini_analyst_batch(batch_data: List[Dict[str, Any]], key_manager: KeyManager) -> Tuple[Dict[str, str], str]:
     """
-    Calls the Gemini API with a batch of problems to generate pseudocode.
-
-    Args:
-        batch_data: A list of dictionaries, each containing problem data.
-        key_manager: The KeyManager instance for Gemini API keys.
-
-    Returns:
-        A dictionary mapping problem_id to the generated pseudocode string.
-
-    Raises:
-        Exception: If no API keys are available or the API call fails critically.
+    Calls the Gemini API and intelligently parses the response, looking for
+    the '## FINAL JSON' heading.
+    Returns a tuple of (parsed_json, raw_response_text).
     """
     estimated_tokens = len(str(batch_data))
     managed_key = None
@@ -118,39 +168,54 @@ def call_gemini_analyst_batch(batch_data: List[Dict[str, Any]], key_manager: Key
 
         logging.info(f"Calling Gemini Analyst with a batch of {len(batch_data)} problems (key: ...{managed_key.key_string[-4:]})")
         response = model.generate_content(prompt, safety_settings=safety_settings)
+        response_text = response.text
 
-        if not response.parts:
+        if not response.parts and not response_text:
+            logging.error(f"Gemini API Blocked Response Details: {response.prompt_feedback}")
             block_reason = response.prompt_feedback.block_reason.name if response.prompt_feedback else "Unknown"
             raise Exception(f"Gemini API call was blocked. Reason: {block_reason}")
 
-        response_text = response.text
-        # Clean the response to extract only the JSON object
-        cleaned_text = response_text.strip().removeprefix("```json").removesuffix("```").strip()
-        json_start_index = cleaned_text.find('{')
-        json_end_index = cleaned_text.rfind('}')
+        # --- FINAL PARSING LOGIC FOR MARKDOWN HEADERS ---
+        
+        # 1. Find the '## FINAL JSON' heading.
+        start_heading_pos = response_text.find('## FINAL JSON')
+        if start_heading_pos == -1:
+            raise ValueError("Model response did not contain the required '## FINAL JSON' heading.")
+
+        # 2. Define the search area as everything after the heading.
+        json_search_area = response_text[start_heading_pos:]
+        
+        # 3. Find the first opening brace and the last closing brace in that area.
+        json_start_index = json_search_area.find('{')
+        json_end_index = json_search_area.rfind('}')
+
         if json_start_index == -1 or json_end_index == -1:
-            raise ValueError("Could not find a valid JSON object in the model's response.")
-        json_string = cleaned_text[json_start_index : json_end_index + 1]
-
-        key_manager.release_key(managed_key, KeyStatus.AVAILABLE, tokens_used=0) # Token count not available for batch
-        duration_ms = int((time.perf_counter() - start_time) * 1000)
-        db.log_metric('ANALYSIS', 'api_call', duration_ms, True, {'service': 'gemini', 'batch_size': len(batch_data)})
-
-        return json.loads(json_string)
+            raise ValueError("Could not find a valid JSON object after '## FINAL JSON' heading.")
+        
+        # 4. Slice precisely to get the JSON string.
+        json_string = json_search_area[json_start_index : json_end_index + 1]
+        
+        parsed_json = json.loads(json_string)
+        key_manager.release_key(managed_key, KeyStatus.AVAILABLE, tokens_used=0)
+        db.log_metric('ANALYSIS', 'api_call', int((time.perf_counter() - start_time) * 1000), True, {'service': 'gemini', 'batch_size': len(batch_data)})
+        
+        # The worker will handle partial success by comparing keys; this function just returns what it found.
+        return (parsed_json, response_text)
 
     except Exception as e:
-        outcome = KeyStatus.RATE_LIMITED # Assume rate limiting on any error for safety
+        outcome = KeyStatus.RATE_LIMITED
+        error_str = str(e).lower()
+        if managed_key and ("api key not valid" in error_str or "permission_denied" in error_str):
+            logging.warning(f"DETECTED INVALID API KEY: ...{managed_key.key_string[-4:]}")
+            outcome = KeyStatus.INVALID
         if managed_key:
             key_manager.release_key(managed_key, outcome, tokens_used=0)
-
-        duration_ms = int((time.perf_counter() - start_time) * 1000)
-        db.log_metric('ANALYSIS', 'api_call', duration_ms, False, {'service': 'gemini', 'error': str(e), 'batch_size': len(batch_data)})
-
+        
+        db.log_metric('ANALYSIS', 'api_call', int((time.perf_counter() - start_time) * 1000), False, {'service': 'gemini', 'error': str(e)})
         logging.error(f"Gemini API batch call failed: {e}")
-        if "json" in str(e).lower():
+        if response_text:
             logging.error(f"--- RAW RESPONSE START ---\n{response_text}\n--- RAW RESPONSE END ---")
         raise
-
 def call_groq_implementer(problem_html: str, pseudocode: str, vjs_report: str, key_manager: KeyManager) -> str:
     """
     Calls the Groq API to generate C++ code from pseudocode.

@@ -173,16 +173,35 @@ def transition_to_pending_calibration(problem_id: str):
     save_process_history(problem_id, 'INGESTION', 'SUCCESS', 'Multi-oracle data ingested. Ready for calibration.')
 
 # --- ADD THIS NEW WORKSPACE SAVE FUNCTION ---
-def save_calibration_results(problem_id: str, validated_pretests: List[Dict], slowness_factor: float, checker_mode: str):
-    """Saves the output of a successful calibration stage to the workspace."""
+def save_calibration_results(problem_id: str, successful_oracles: int, compiled_paths: list, validated_pretests: list, slowness_factor: float, checker_mode: str):
+    """
+    Saves the output of a successful calibration stage to the workspace and
+    updates the main problems table.
+    """
+    # 1. (SYNC) Write the detailed results to the workspace cache.
+    # This data is needed immediately by the downstream VJS worker.
     with _get_db_connection(WORKSPACE_DB_PATH) as conn:
         conn.execute(
             """UPDATE problem_data_cache 
-               SET validated_pretests_json = ?, slowness_factor = ?, checker_mode = ?
+               SET compiled_oracle_paths_json = ?, validated_pretests_json = ?, 
+                   slowness_factor = ?, checker_mode = ?
                WHERE problem_id = ?""",
-            (json.dumps(validated_pretests), slowness_factor, checker_mode, problem_id)
+            (
+                json.dumps(compiled_paths),
+                json.dumps(validated_pretests),
+                slowness_factor,
+                checker_mode,
+                problem_id
+            )
         )
-def save_multi_oracle_ingestion_data(problem_id: str, html: str, pretests: list, successful_solutions: list):
+
+    # 2. (ASYNC) Update the main problems table with the oracle count and confidence level.
+    # This is less critical for immediate use and can be written asynchronously.
+    sql = "UPDATE problems SET successful_oracles = ?, confidence_level = 1 WHERE id = ?"
+    params = (successful_oracles, problem_id)
+    db_writer.execute(sql, params)
+    
+def save_multi_oracle_ingestion_data(problem_id: str, html: str, pretests: list, successful_solutions: list, time_limit_raw: str, memory_limit_raw: str):
     """
     Saves the ingested multi-oracle data to the appropriate tables in the
     progress and workspace databases.
@@ -203,15 +222,18 @@ def save_multi_oracle_ingestion_data(problem_id: str, html: str, pretests: list,
         conn.execute(
             """INSERT OR REPLACE INTO problem_data_cache
                (problem_id, problem_statement_html, reference_solution_json, 
-                reference_solution_code, secondary_reference_codes_json, pretests_json)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+                reference_solution_code, secondary_reference_codes_json, pretests_json,
+                time_limit_raw, memory_limit_raw)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 problem_id,
                 html,
                 json.dumps(primary_submission_obj),
                 primary_solution_code,
                 json.dumps(secondary_codes),
-                json.dumps(pretests)
+                json.dumps(pretests),
+                time_limit_raw,
+                memory_limit_raw
             )
         )
     

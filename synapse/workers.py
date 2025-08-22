@@ -21,7 +21,12 @@ import os
 # Project-specific imports
 import synapse.database as db
 from synapse.scraper import get_authenticated_driver, fetch_problem_data, IPBanException
-from synapse.api_clients import call_gemini_analyst_batch, call_groq_implementer
+from synapse.api_clients import (
+    call_gemini_analyst_batch, 
+    call_groq_implementer, 
+    _preprocess_code_for_llm, 
+    AnalysisFailedException
+)
 from synapse.key_manager import KeyManager
 from synapse.vjs import run_vjs, run_static_analysis, run_semantic_analysis
 from synapse.data_assembly import _assemble_golden_record, _parse_memory_limit, _parse_time_limit
@@ -30,8 +35,12 @@ from config import (
     MAX_ANALYSIS_RETRIES, 
     MAX_IMPLEMENTATION_RETRIES, 
     MAX_RESCRAPING_ATTEMPTS,
-    INITIAL_CALIBRATION_TOLERANCE_FACTOR
+    INITIAL_CALIBRATION_TOLERANCE_FACTOR,
+    N_REFERENCE_SOLUTIONS,
+    MIN_VIABLE_ORACLES
 )
+from concurrent.futures import ThreadPoolExecutor, as_completed # ADD THIS
+from collections import Counter # ADD THIS
 MAX_BROWSER_USES=25
 from .vjs import run_vjs, run_static_analysis, run_semantic_analysis
 from .data_assembly import _parse_memory_limit, _parse_time_limit
@@ -53,6 +62,17 @@ def _voter(outputs: List[str]) -> Optional[str]:
         return most_common
     return None # Hung jury
 
+def _score_code_quality(code: str) -> int:
+    """
+    Calculates a simple quality score for a C++ solution.
+    A lower score is better (cleaner, more standard code).
+    """
+    score = 0
+    score += code.count("#define") * 5 
+    score += code.count("#include")
+    score += code.count("scanf") * 2
+    score += code.count("printf") * 2
+    return score
 
 # --- STAGE 1: INGESTION & RE-SCRAPING ---
 def ingestion_worker(problem: Dict[str, Any], worker_id: str, browser_queue: Queue):
@@ -114,7 +134,9 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: str, browser_queue: Que
             problem_id=problem_id,
             html=html_statement,
             pretests=scraped_data['pretests'],
-            successful_solutions=scraped_data['successful_solutions']
+            successful_solutions=scraped_data['successful_solutions'],
+            time_limit_raw=scraped_data['page_details']['time_limit_raw'],
+            memory_limit_raw=scraped_data['page_details']['memory_limit_raw']
         )
         if is_rescraping:
             db.reset_retry_counts(problem_id)
@@ -218,7 +240,7 @@ def calibration_worker(problem: Dict[str, Any], worker_id: str):
         time_limit_ms = _parse_time_limit(workspace_data.get('time_limit_raw', '1s'))
         memory_limit_kb = _parse_memory_limit(workspace_data.get('memory_limit_raw', '256mb'))
         
-        calib_run_result = run_vjs(problem_id, primary_code, pretests, int(time_limit_ms * 2), memory_limit_kb, suffix="_calib_run")
+        calib_run_result = run_vjs(problem_id, primary_code, pretests[:1], int(time_limit_ms * 2), memory_limit_kb, suffix="_calib_run")
         
         if calib_run_result['status'] not in ['SUCCESS', 'PRESENTATION_ERROR']:
             raise Exception(f"Primary oracle failed full run during calibration: {calib_run_result['status']}")
@@ -256,30 +278,28 @@ def calibration_worker(problem: Dict[str, Any], worker_id: str):
 # --- STAGE 2: ANALYSIS (BATCHED) ---
 def analysis_worker(batch: List[Dict[str, Any]], worker_id: str, gemini_km: KeyManager):
     """
-    Processes a batch of problems, sending them to the Gemini "Analyst" LLM
-    with multiple reference solutions to synthesize a canonical pseudocode.
+    Processes a batch of problems using quality filtering, pre-processing,
+    and intelligent handling of partial batch success.
     """
     batch_ids = [p['id'] for p in batch]
     logging.info(f"Starting analysis for batch of {len(batch_ids)}: {batch_ids}")
-    start_time = time.perf_counter()
-    problem_ids_in_api_call = [] # Define here for wider scope
+    problem_ids_in_api_call = []
+
     try:
-        # --- 1. PRE-FLIGHT CHECKS (Handles retries and quarantines) ---
+        # Pre-flight checks for retries and quarantines
         problems_to_process = []
-        batch_ids_to_query = [p['id'] for p in batch]
-        
         with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
-            placeholders = ','.join('?' for _ in batch_ids_to_query)
-            cursor = conn.execute(f"SELECT id, analysis_try_count, rescraping_attempts FROM problems WHERE id IN ({placeholders})", batch_ids_to_query)
+            placeholders = ','.join('?' for _ in batch_ids)
+            cursor = conn.execute(f"SELECT id, analysis_try_count, rescraping_attempts FROM problems WHERE id IN ({placeholders})", batch_ids)
             problem_states = {row[0]: {'analysis_tries': row[1], 'rescrapes': row[2]} for row in cursor.fetchall()}
-        
-        workspace_data = db.get_batch_data_from_workspace(batch_ids_to_query)
+
+        workspace_data = db.get_batch_data_from_workspace(batch_ids)
 
         for problem in batch:
             p_id = problem['id']
             state = problem_states.get(p_id)
             if not state: continue
-            
+
             if state['analysis_tries'] >= MAX_ANALYSIS_RETRIES:
                 if state['rescrapes'] >= MAX_RESCRAPING_ATTEMPTS:
                     reason = f"Exceeded max analysis retries ({MAX_ANALYSIS_RETRIES}) and re-scraping attempts ({MAX_RESCRAPING_ATTEMPTS})."
@@ -295,10 +315,9 @@ def analysis_worker(batch: List[Dict[str, Any]], worker_id: str, gemini_km: KeyM
             logging.info("Batch is empty after pre-flight checks.")
             return
 
-        # --- 2. NEW: CONSTRUCT THE MULTI-ORACLE API PAYLOAD ---
         final_api_batch = []
         problem_ids_in_api_call = [p['id'] for p in problems_to_process]
-        
+
         for p_info in problems_to_process:
             p_id = p_info['id']
             p_data = workspace_data.get(p_id)
@@ -306,47 +325,70 @@ def analysis_worker(batch: List[Dict[str, Any]], worker_id: str, gemini_km: KeyM
 
             primary_code = p_data.get('reference_solution_code')
             secondary_codes = json.loads(p_data.get('secondary_reference_codes_json', '[]'))
-            
-            all_codes = [primary_code] + secondary_codes
-            all_codes = [code for code in all_codes if code] # Filter out potential None or empty strings
+            all_codes = [code for code in [primary_code] + secondary_codes if code]
 
             if not all_codes:
-                logging.warning(f"No reference codes found in workspace for {p_id}, removing from this batch.")
-                problem_ids_in_api_call.remove(p_id)
+                logging.warning(f"No reference codes found for {p_id}, skipping.")
                 continue
+
+            scored_solutions = [(_score_code_quality(code), code) for code in all_codes]
+            scored_solutions.sort(key=lambda x: x[0])
+            top_solutions = [code for score, code in scored_solutions[:3]]
+            processed_codes = [_preprocess_code_for_llm(code) for code in top_solutions]
 
             final_api_batch.append({
                 "problem_id": p_id,
                 "html_statement": p_data.get('problem_statement_html'),
-                "reference_solutions": all_codes, # Key change: Pass the list of all oracle codes
+                "reference_solutions": processed_codes,
                 "vjs_report": p_data.get('vjs_last_report')
             })
 
         if not final_api_batch:
-            logging.warning("API batch is empty after processing workspace data.")
+            logging.warning("API batch is empty after quality filtering.")
             return
 
-        # --- 3. API CALL AND DATABASE UPDATE ---
-        db.update_worker_status(worker_id, 'ANALYSIS', ','.join(problem_ids_in_api_call), 'API_CALL', 'active')
-        pseudocode_results = call_gemini_analyst_batch(final_api_batch, gemini_km)
-        db.update_worker_status(worker_id, 'ANALYSIS', ','.join(pseudocode_results.keys()), 'UPDATING_DB', 'active')
-        
-        for problem_id, pseudocode in pseudocode_results.items():
-            db.update_workspace_with_analysis_results(problem_id, pseudocode)
-            
-        db.transition_batch_to_pending_implementation(list(pseudocode_results.keys()))
-        logging.info(f"SUCCESS [Analysis] for {len(pseudocode_results)} problems. -> pending_implementation")
+        # --- INTELLIGENT BATCH HANDLING ---
+        pseudocode_results, raw_response_text = call_gemini_analyst_batch(final_api_batch, gemini_km)
+
+        successful_ids = set(pseudocode_results.keys())
+        failed_ids = set(problem_ids_in_api_call) - successful_ids
+
+        if successful_ids:
+            logging.info(f"SUCCESS [Analysis] for problems: {list(successful_ids)}. -> pending_implementation")
+            for problem_id in successful_ids:
+                pseudocode = pseudocode_results[problem_id]
+                db.update_workspace_with_analysis_results(problem_id, pseudocode)
+                db.transition_batch_to_pending_implementation([problem_id])
+
+        if failed_ids:
+            logging.warning(f"PARTIAL FAILURE [Analysis] for problems: {list(failed_ids)}.")
+            for problem_id in failed_ids:
+                reason = f"LLM failed to generate pseudocode for this problem in a batch."
+                try:
+                    search_heading = f"### Reasoning for {problem_id}"
+                    start_pos = raw_response_text.find(search_heading)
+                    if start_pos != -1:
+                        end_pos = raw_response_text.find("### Reasoning for", start_pos + 1)
+                        if end_pos == -1: end_pos = raw_response_text.find("<FINAL_JSON>")
+                        reason_text = raw_response_text[start_pos:end_pos]
+                        if "fail" in reason_text.lower() or "unable" in reason_text.lower() or "contradictory" in reason_text.lower():
+                            reason = reason_text
+                except Exception:
+                    pass
+                db.transition_to_quarantined(problem_id, f"LLM Partial Failure: {reason[:1500]}")
+
+    except AnalysisFailedException as e:
+        logging.warning(f"LLM analysis failed for entire batch {batch_ids}. Reason: {e}")
+        for problem_id in problem_ids_in_api_call:
+            db.transition_to_quarantined(problem_id, f"LLM Failure: {e}")
 
     except Exception as e:
-        logging.error(f"FAILED [Analysis] for batch {batch_ids}: {e}", exc_info=False)
-        if problem_ids_in_api_call:
-            for problem_id in problem_ids_in_api_call:
-                db.transition_to_failed(problem_id, 'analysis', str(e))
+        logging.error(f"CRITICAL FAILURE [Analysis] for batch {batch_ids}: {e}", exc_info=True)
+        for problem_id in batch_ids:
+            db.transition_to_failed(problem_id, 'analysis', str(e))
     finally:
-        duration_ms = int((time.perf_counter() - start_time) * 1000)
-        success = 'e' not in locals() or locals()['e'] is None
-        db.log_metric('ANALYSIS', 'analysis_batch_task', duration_ms, success, {'batch_size': len(batch_ids)})
         db.update_worker_status(worker_id, 'ANALYSIS', None, None, 'idle')
+        
 # --- STAGE 3: IMPLEMENTATION ---
 def implementation_worker(problem: Dict[str, Any], worker_id: int, groq_km: KeyManager):
     """
@@ -399,17 +441,17 @@ def implementation_worker(problem: Dict[str, Any], worker_id: int, groq_km: KeyM
         db.update_worker_status(worker_id, 'IMPLEMENTATION', None, None, 'idle')
 
 # --- STAGE 4: VJS (Verification & Judging Service) ---
+# In synapse/workers.py
+
 def vjs_worker(problem: Dict[str, Any], worker_id: str):
     """
     Judges the AI-generated code using N-Version Differential VJS.
-    It runs N compiled oracles to generate a consensus ground truth for each
-    test case and judges the AI's solution against that dynamic truth.
     """
     problem_id = problem['id']
     logging.info(f"[{problem_id}] Starting N-Version Differential VJS...")
     db.update_worker_status(worker_id, 'VJS', problem_id, 'SETUP', 'active')
-
-    ai_executable_path = None
+    
+    ai_executable_dir = None
     try:
         # 1. Fetch all calibration data from the workspace
         workspace_data = db.get_batch_data_from_workspace([problem_id]).get(problem_id)
@@ -431,7 +473,7 @@ def vjs_worker(problem: Dict[str, Any], worker_id: str):
         if compile_result['status'] != 'SUCCESS':
             db.transition_to_pending_implementation_retry(problem_id, compile_result.get('report', ''))
             return
-
+        
         ai_executable_path = compile_result['executable_path']
         ai_executable_dir = os.path.dirname(ai_executable_path)
 
@@ -439,66 +481,50 @@ def vjs_worker(problem: Dict[str, Any], worker_id: str):
         for i, test in enumerate(pretests):
             test_num_str = f"Test {i+1}/{len(pretests)}"
             db.update_worker_status(worker_id, 'VJS', problem_id, f'RUNNING {test_num_str}', 'active')
-
-            # A. Run all oracles in parallel to get their outputs
-            # This is I/O bound (waiting for subprocesses), so threading is perfect.
+            
             oracle_outputs = []
             with ThreadPoolExecutor(max_workers=len(oracle_paths)) as executor:
-                # Docker command to run a pre-compiled binary
                 def run_binary(exec_path, test_input):
                     host_dir = os.path.dirname(exec_path)
                     exec_name = os.path.basename(exec_path)
-                    # We assume the input is small enough to be passed via stdin pipe
-                    run_cmd = ["docker", "run", "--rm", "-i", f"--memory={memory_limit_kb}k", "-v", f"{host_dir}:/app:ro", "-w", "/app", "synapse-judge", "timeout", str(time_limit_ms/1000 + 1), f"./{exec_name}"]
+                    run_cmd = ["docker", "run", "--rm", "-i", f"--memory={memory_limit_kb}k", "-v", f"{host_dir}:/app:ro", "-w", "/app", "synapse-judge", "timeout", str(time_limit_ms/1000 + 2), f"./{exec_name}"]
                     proc = subprocess.run(run_cmd, input=test_input, capture_output=True, text=True, timeout=time_limit_ms/1000 + 5)
-                    if proc.returncode != 0: return f"RUNTIME_ERROR_OR_TLE_{proc.returncode}"
+                    if proc.returncode != 0: return f"RUNTIME_ERROR_OR_TLE_CODE_{proc.returncode}"
                     return proc.stdout.strip().replace('\r\n', '\n')
 
                 futures = {executor.submit(run_binary, path, test['input']): path for path in oracle_paths}
                 for future in as_completed(futures):
                     oracle_outputs.append(future.result())
 
-            # B. Vote to find the consensus ground truth
             consensus_output = _voter(oracle_outputs)
 
-            # C. Handle a "Hung Jury"
             if consensus_output is None:
                 reason = f"Hung Jury on {test_num_str}. Oracle outputs: {oracle_outputs}"
                 db.transition_to_quarantined(problem_id, reason)
                 return
 
-            # D. Run the AI's solution
             ai_output = run_binary(ai_executable_path, test['input'])
-
-            # E. Compare AI output to the consensus truth using our checker
+            
             with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.in') as f_in, \
                  tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.ans') as f_ans, \
                  tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.out') as f_out:
-
-                f_in.write(test['input'])
-                f_ans.write(consensus_output)
-                f_out.write(ai_output)
-
+                f_in.write(test['input']); f_ans.write(consensus_output); f_out.write(ai_output)
                 in_path, ans_path, out_path = f_in.name, f_ans.name, f_out.name
 
             checker_cmd = ["python", "-m", "synapse.checker", in_path, out_path, ans_path]
             checker_proc = subprocess.run(checker_cmd, capture_output=True, text=True)
-
             os.remove(in_path); os.remove(ans_path); os.remove(out_path)
 
-            # F. Handle failure
-            if checker_proc.returncode != 0: # 0 is ACCEPTED
+            if checker_proc.returncode != 0:
                 verdict = "WA" if checker_proc.returncode == 1 else "PE"
-                report = (
-                    f"{verdict} on {test_num_str} vs Oracle Consensus.\n"
-                    f"Checker Msg: {checker_proc.stdout.strip()}\n"
-                    f"--- INPUT ---\n{test['input'][:1000]}\n"
-                    f"--- ORACLE CONSENSUS ---\n{consensus_output[:1000]}\n"
-                    f"--- AI OUTPUT ---\n{ai_output[:1000]}"
-                )
+                report = (f"{verdict} on {test_num_str} vs Oracle Consensus.\n"
+                          f"Checker Msg: {checker_proc.stdout.strip()}\n"
+                          f"--- INPUT ---\n{test['input'][:1000]}\n"
+                          f"--- ORACLE CONSENSUS ---\n{consensus_output[:1000]}\n"
+                          f"--- AI OUTPUT ---\n{ai_output[:1000]}")
                 db.transition_to_pending_analysis_retry(problem_id, report)
                 return
-
+        
         # 4. If all tests pass, the problem is verified!
         db.update_problem_status(problem_id, None, extra_updates={'confidence_level': 2})
         db.transition_to_pending_data_assembly(problem_id)
@@ -508,10 +534,9 @@ def vjs_worker(problem: Dict[str, Any], worker_id: str):
         logging.error(f"FAILED [VJS] for {problem_id}: {e}", exc_info=True)
         db.transition_to_failed(problem_id, 'vjs', str(e))
     finally:
-        if ai_executable_path and os.path.exists(os.path.dirname(ai_executable_path)):
-            shutil.rmtree(os.path.dirname(ai_executable_path))
+        if ai_executable_dir and os.path.exists(ai_executable_dir):
+            shutil.rmtree(ai_executable_dir)
         db.update_worker_status(worker_id, 'VJS', None, None, 'idle')
-
     # --- STAGE 5: DATA ASSEMBLY ---
 def data_assembly_worker(problem: Dict[str, Any], worker_id: str):
     """

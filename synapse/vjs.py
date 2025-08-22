@@ -36,37 +36,36 @@ PRESENTATION_ERROR = 2
 def _truncate_text(text: str, max_len: int = 2000) -> str:
     """Truncates text to a max length, showing the start and end."""
     return text
-
 def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int, memory_limit_kb: int, suffix: str = "", compile_only: bool = False) -> Dict[str, Any]:
     """
-    Compiles and runs C++ code in a Docker sandbox, then uses a separate
-    checker script to validate the output.
-    (V5 - Verbose Failure Reporting)
+    Compiles and runs C++ code in a Docker sandbox.
+    If compile_only is True, it only compiles and returns the executable path.
     """
     logging.info(f"--- VJS START: Problem {problem_id}{suffix} ---")
-    dir_name = f"{problem_id}{suffix}"
+    dir_name = f"{problem_id}{suffix.replace(' ', '_')}"
     host_dir = os.path.join(os.getcwd(), "temp_vjs", dir_name)
     os.makedirs(host_dir, exist_ok=True)
-
+    abs_host_dir = os.path.abspath(host_dir)
+    user_id = f"{os.getuid()}:{os.getgid()}"
     try:
         # --- STAGE 1: Compilation ---
         logging.info(f"[{problem_id}] Stage 1: Compiling source code...")
         source_path = os.path.join(host_dir, "main.cpp")
         with open(source_path, "w", encoding="utf-8") as f: f.write(code)
 
-        abs_host_dir = os.path.abspath(host_dir)
-        compile_cmd = ["docker", "run", "--rm", "-v", f"{abs_host_dir}:/app", "-w", "/app", "synapse-judge", "g++", "main.cpp", "-o", "main", "-O2", "-std=c++23", "-static"]
+        compile_cmd = ["docker", "run", "--rm","-u",user_id, "-v", f"{abs_host_dir}:/app", "-w", "/app", "synapse-judge", "g++", "main.cpp", "-o", "main", "-O2", "-std=c++23", "-static"]
         compile_proc = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=VJS_COMPILATION_TIMEOUT)
 
         if compile_proc.returncode != 0:
             logging.error(f"[{problem_id}] Compilation FAILED.")
             return {'status': 'COMPILE_ERROR', 'report': compile_proc.stderr[:2000]}
+        
         logging.info(f"[{problem_id}] Compilation SUCCEEDED.")
         
         if compile_only:
-            # Return the path to the compiled binary for the calibration worker to use
             executable_path = os.path.join(abs_host_dir, "main")
             return {'status': 'SUCCESS', 'executable_path': executable_path}
+
         if not pretests:
             logging.warning(f"[{problem_id}] No pretests provided for full run. VJS complete.")
             return {'status': 'SUCCESS', 'report': 'No pretests to run.', 'execution_time_ms': 0}
@@ -87,28 +86,23 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
 
             timeout_sec = (time_limit_ms / 1000.0) + 2.0
             run_cmd_inside = f"/usr/bin/time -f \"%e\" ./main"
-            docker_run_cmd = ["docker", "run", "--rm", "-i", "--memory", f"{memory_limit_kb}k", "-v", f"{abs_host_dir}:/app:ro", "-w", "/app", "synapse-judge", "timeout", str(timeout_sec), "/bin/sh", "-c", run_cmd_inside]
+            docker_run_cmd = ["docker", "run", "--rm","-u",user_id, "-i", "--memory", f"{memory_limit_kb}k", "-v", f"{abs_host_dir}:/app:ro", "-w", "/app", "synapse-judge", "timeout", str(timeout_sec), "/bin/sh", "-c", run_cmd_inside]
 
             with open(input_path, 'r') as stdin_f, open(output_path, 'w') as stdout_f:
                 try:
                     run_proc = subprocess.run(docker_run_cmd, stdin=stdin_f, stdout=stdout_f, stderr=subprocess.PIPE, text=True, timeout=timeout_sec + 5)
                 except subprocess.TimeoutExpired:
-                    report = f"TLE on {test_num_str} (VJS Subsystem Timeout).\n\n--- INPUT ---\n{_truncate_text(test['input'])}"
+                    report = f"TLE on {test_num_str} (VJS Subsystem Timeout).\n\n--- INPUT ---\n{test['input'][:2000]}"
                     return {'status': 'TIME_LIMIT_EXCEEDED', 'report': report}
 
-            # --- VERBOSE FAILURE REPORTING ---
             if run_proc.returncode == 124:
-                report = f"TLE on {test_num_str}.\n\n--- INPUT ---\n{_truncate_text(test['input'])}"
+                report = f"TLE on {test_num_str}.\n\n--- INPUT ---\n{test['input'][:2000]}"
                 return {'status': 'TIME_LIMIT_EXCEEDED', 'report': report}
-                        # ADD THIS BLOCK
             if run_proc.returncode == 137:
-                report = f"MLE on {test_num_str} (Potential Memory Limit Exceeded, exit code 137).\n\n--- INPUT ---\n{_truncate_text(test['input'])}"
+                report = f"MLE on {test_num_str}.\n\n--- INPUT ---\n{test['input'][:2000]}"
                 return {'status': 'MEMORY_LIMIT_EXCEEDED', 'report': report}
-            if run_proc.returncode in [136, 139]:
-                report = f"RE on {test_num_str} (signal {run_proc.returncode - 128}).\n\n--- INPUT ---\n{_truncate_text(test['input'])}"
-                return {'status': 'RUNTIME_ERROR', 'report': report}
             if run_proc.returncode != 0:
-                report = f"RE on {test_num_str} (exit code {run_proc.returncode}).\n\n--- INPUT ---\n{_truncate_text(test['input'])}"
+                report = f"RE on {test_num_str} (exit code {run_proc.returncode}).\n\n--- INPUT ---\n{test['input'][:2000]}"
                 return {'status': 'RUNTIME_ERROR', 'report': report}
 
             try:
@@ -121,23 +115,23 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
             checker_cmd = ["python", "-m", "synapse.checker", input_path, output_path, answer_path]
             checker_proc = subprocess.run(checker_cmd, capture_output=True, text=True)
 
-            if checker_proc.returncode in [WRONG_ANSWER, PRESENTATION_ERROR]:
+            if checker_proc.returncode in [1, 2]: # WRONG_ANSWER or PRESENTATION_ERROR
                 user_output = "[Could not read user output file]"
                 try:
                     with open(output_path, 'r', encoding='utf-8') as f: user_output = f.read()
                 except IOError: pass
                 
-                verdict = "WA" if checker_proc.returncode == WRONG_ANSWER else "PE"
+                verdict = "WA" if checker_proc.returncode == 1 else "PE"
                 report = (
                     f"{verdict} on {test_num_str}: {checker_proc.stdout.strip()}\n\n"
-                    f"--- INPUT ---\n{_truncate_text(test['input'])}\n\n"
-                    f"--- EXPECTED OUTPUT ---\n{_truncate_text(test['output'])}\n\n"
-                    f"--- ACTUAL OUTPUT ---\n{_truncate_text(user_output)}"
+                    f"--- INPUT ---\n{test['input'][:2000]}\n\n"
+                    f"--- EXPECTED OUTPUT ---\n{test['output'][:2000]}\n\n"
+                    f"--- ACTUAL OUTPUT ---\n{user_output[:2000]}"
                 )
                 status = 'WRONG_ANSWER' if verdict == "WA" else 'PRESENTATION_ERROR'
                 return {'status': status, 'report': report}
 
-            if checker_proc.returncode != ACCEPTED:
+            if checker_proc.returncode != 0: # ACCEPTED is 0
                 return {'status': 'VJS_ERROR', 'report': f'Checker failed on {test_num_str}: {checker_proc.stdout.strip()}'}
             
             logging.info(f"[{problem_id}] {test_num_str}: PASSED.")
@@ -145,8 +139,11 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
         logging.info(f"--- VJS SUCCESS: All {len(pretests)} tests passed for {problem_id}{suffix} ---")
         return {'status': 'SUCCESS', 'report': f'All {len(pretests)} tests passed', 'execution_time_ms': total_execution_time_ms}
     finally:
+        # Only clean up the directory if we were doing a full run.
+        # The calibration_worker is responsible for cleaning up compile_only directories.
         if os.path.exists(host_dir) and not compile_only:
             shutil.rmtree(host_dir)
+
 def run_static_analysis(code: str) -> Dict[str, Any]:
     """Runs cppcheck for static analysis on a C++ code string."""
     with tempfile.NamedTemporaryFile(mode='w+', suffix='.cpp', delete=False) as temp_f:

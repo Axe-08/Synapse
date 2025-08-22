@@ -225,6 +225,9 @@ def _get_source_from_page(driver: uc.Chrome, url: str) -> Optional[str]:
         The scraped source code as a string, or None on failure.
     """
     try:
+        delay = config_manager.get_param('scraper_delay_seconds', DEFAULT_SCRAPER_DELAY_SECONDS)
+        time.sleep(delay)
+
         logging.info(f"Navigating to submission URL: {url}")
         driver.get(url)
         wait = WebDriverWait(driver, DEFAULT_SELENIUM_SHORT_WAIT)
