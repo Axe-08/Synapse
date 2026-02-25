@@ -1,0 +1,199 @@
+{
+  "timestamp": "2026-02-22T06:12:14.898107",
+  "gemini": [
+    {
+      "idx": 1,
+      "short": "...eTPfoefs",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 1680,
+      "detail": "OK"
+    },
+    {
+      "idx": 2,
+      "short": "...I-tOf23o",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 1701,
+      "detail": "OK"
+    },
+    {
+      "idx": 3,
+      "short": "...nn55t8aM",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 1894,
+      "detail": "OK"
+    },
+    {
+      "idx": 4,
+      "short": "...Vz3gxu_Q",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 1896,
+      "detail": "OK"
+    },
+    {
+      "idx": 5,
+      "short": "...8rtzFIUw",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 1781,
+      "detail": "OK"
+    },
+    {
+      "idx": 6,
+      "short": "...cc-pGA7w",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 1954,
+      "detail": "OK"
+    },
+    {
+      "idx": 7,
+      "short": "...6x3lkVl8",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 2012,
+      "detail": "OK"
+    },
+    {
+      "idx": 8,
+      "short": "...zitt2aHI",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 2011,
+      "detail": "OK"
+    },
+    {
+      "idx": 9,
+      "short": "...0W3c6eKM",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 2180,
+      "detail": "OK"
+    },
+    {
+      "idx": 10,
+      "short": "...b_wtMatg",
+      "status": "\ud83d\udd34  RATE LIMITED / QUOTA",
+      "ok": false,
+      "latency_ms": 1039,
+      "detail": "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and "
+    },
+    {
+      "idx": 11,
+      "short": "...gqgJ5wS4",
+      "status": "\ud83d\udd34  RATE LIMITED / QUOTA",
+      "ok": false,
+      "latency_ms": 1032,
+      "detail": "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and "
+    },
+    {
+      "idx": 12,
+      "short": "...kJKaq9PA",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 2015,
+      "detail": "OK"
+    },
+    {
+      "idx": 13,
+      "short": "...PqoEqJo8",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 2366,
+      "detail": "OK"
+    },
+    {
+      "idx": 14,
+      "short": "...eYKcH5bE",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 2067,
+      "detail": "OK"
+    },
+    {
+      "idx": 15,
+      "short": "...VzlaKgWE",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 2064,
+      "detail": "OK"
+    },
+    {
+      "idx": 16,
+      "short": "...yGW2vwAg",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 2068,
+      "detail": "OK"
+    },
+    {
+      "idx": 17,
+      "short": "...EetcQkHE",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 2277,
+      "detail": "OK"
+    },
+    {
+      "idx": 18,
+      "short": "...7nMhfVqA",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 1948,
+      "detail": "OK"
+    },
+    {
+      "idx": 19,
+      "short": "...xubU9SxQ",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 1945,
+      "detail": "Okay"
+    }
+  ],
+  "groq": [
+    {
+      "idx": 1,
+      "short": "...uzKBqceD",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 550,
+      "detail": "reply='OK'  tokens_used=39"
+    },
+    {
+      "idx": 2,
+      "short": "...GDCtVSQa",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 196,
+      "detail": "reply='OK'  tokens_used=39"
+    },
+    {
+      "idx": 3,
+      "short": "...dv7IVEbc",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 181,
+      "detail": "reply='OK'  tokens_used=39"
+    },
+    {
+      "idx": 4,
+      "short": "...tFa24SNg",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 145,
+      "detail": "reply='OK'  tokens_used=39"
+    },
+    {
+      "idx": 5,
+      "short": "...PlGapXYn",
+      "status": "\u2705  AVAILABLE",
+      "ok": true,
+      "latency_ms": 147,
+      "detail": "reply='OK'  tokens_used=39"
+    }
+  ]
+}

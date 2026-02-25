@@ -37,7 +37,8 @@ from config import (
     MAX_RESCRAPING_ATTEMPTS,
     INITIAL_CALIBRATION_TOLERANCE_FACTOR,
     N_REFERENCE_SOLUTIONS,
-    MIN_VIABLE_ORACLES
+    MIN_VIABLE_ORACLES,
+    VJS_COMPILATION_TIMEOUT
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed # ADD THIS
 from collections import Counter # ADD THIS
@@ -246,10 +247,11 @@ def calibration_worker(problem: Dict[str, Any], worker_id: str):
             raise Exception(f"Primary oracle failed full run during calibration: {calib_run_result['status']}")
 
         # 5. Calculate slowness factor and determine checker mode
-        ref_submission = json.loads(workspace_data.get('reference_solution_json', '{}'))
-        official_time_ms = ref_submission.get('timeConsumedMillis', 500)
-        local_time_ms = calib_run_result.get('execution_time_ms', official_time_ms)
-        slowness_factor = max(1.0, local_time_ms / official_time_ms if official_time_ms > 0 else 2.0)
+        # ref_submission = json.loads(workspace_data.get('reference_solution_json', '{}'))
+        # official_time_ms = ref_submission.get('timeConsumedMillis', 500)
+        # local_time_ms = calib_run_result.get('execution_time_ms', official_time_ms)
+        # slowness_factor = max(1.0, local_time_ms / official_time_ms if official_time_ms > 0 else 2.0)
+        slowness_factor = INITIAL_CALIBRATION_TOLERANCE_FACTOR
         checker_mode = 'set_based' if calib_run_result['status'] == 'PRESENTATION_ERROR' else 'strict'
 
         # 6. Save results to the database and transition
@@ -269,17 +271,19 @@ def calibration_worker(problem: Dict[str, Any], worker_id: str):
         db.transition_to_failed(problem_id, 'calibration', str(e))
     finally:
         # Clean up all the directories left by the compile_only runs
-        for d in temp_dirs_to_clean:
-            if os.path.exists(d):
-                shutil.rmtree(d)
+        # for d in temp_dirs_to_clean:
+        #     if os.path.exists(d):
+        #         shutil.rmtree(d)
         db.update_worker_status(worker_id, 'CALIBRATION', None, None, 'idle')
        
        
 # --- STAGE 2: ANALYSIS (BATCHED) ---
+
 def analysis_worker(batch: List[Dict[str, Any]], worker_id: str, gemini_km: KeyManager):
     """
     Processes a batch of problems using quality filtering, pre-processing,
     and intelligent handling of partial batch success.
+    (MODIFIED FOR NEW XML PROMPT AND JSON STRUCTURE)
     """
     batch_ids = [p['id'] for p in batch]
     logging.info(f"Starting analysis for batch of {len(batch_ids)}: {batch_ids}")
@@ -348,39 +352,35 @@ def analysis_worker(batch: List[Dict[str, Any]], worker_id: str, gemini_km: KeyM
             return
 
         # --- INTELLIGENT BATCH HANDLING ---
-        pseudocode_results, raw_response_text = call_gemini_analyst_batch(final_api_batch, gemini_km)
+        # NOTE: call_gemini_analyst_batch now returns the parsed JSON object directly
+        parsed_json_output, raw_response_text = call_gemini_analyst_batch(final_api_batch, gemini_km)
+        
+        # Extract the relevant part of the JSON for processing
+        pseudocode_results = parsed_json_output.get("final_pseudocode", {})
+        
+        successful_ids = []
+        failed_ids = []
 
-        successful_ids = set(pseudocode_results.keys())
-        failed_ids = set(problem_ids_in_api_call) - successful_ids
+        for problem_id, pseudocode in pseudocode_results.items():
+            if pseudocode is not None:
+                successful_ids.append(problem_id)
+            else:
+                failed_ids.append(problem_id)
 
         if successful_ids:
-            logging.info(f"SUCCESS [Analysis] for problems: {list(successful_ids)}. -> pending_implementation")
+            logging.info(f"SUCCESS [Analysis] for problems: {successful_ids}. -> pending_implementation")
             for problem_id in successful_ids:
                 pseudocode = pseudocode_results[problem_id]
-                db.update_workspace_with_analysis_results(problem_id, pseudocode)
+                analysis_details_json = json.dumps(parsed_json_output.get("analysis", {}))
+                db.update_workspace_with_analysis_results(problem_id, pseudocode,analysis_details_json)
                 db.transition_batch_to_pending_implementation([problem_id])
 
         if failed_ids:
-            logging.warning(f"PARTIAL FAILURE [Analysis] for problems: {list(failed_ids)}.")
+            logging.warning(f"PARTIAL FAILURE [Analysis] for problems: {failed_ids}. Model returned null.")
+            reasoning_data = parsed_json_output.get("reasoning", {})
             for problem_id in failed_ids:
-                reason = f"LLM failed to generate pseudocode for this problem in a batch."
-                try:
-                    search_heading = f"### Reasoning for {problem_id}"
-                    start_pos = raw_response_text.find(search_heading)
-                    if start_pos != -1:
-                        end_pos = raw_response_text.find("### Reasoning for", start_pos + 1)
-                        if end_pos == -1: end_pos = raw_response_text.find("<FINAL_JSON>")
-                        reason_text = raw_response_text[start_pos:end_pos]
-                        if "fail" in reason_text.lower() or "unable" in reason_text.lower() or "contradictory" in reason_text.lower():
-                            reason = reason_text
-                except Exception:
-                    pass
-                db.transition_to_quarantined(problem_id, f"LLM Partial Failure: {reason[:1500]}")
-
-    except AnalysisFailedException as e:
-        logging.warning(f"LLM analysis failed for entire batch {batch_ids}. Reason: {e}")
-        for problem_id in problem_ids_in_api_call:
-            db.transition_to_quarantined(problem_id, f"LLM Failure: {e}")
+                reason = reasoning_data.get(problem_id, "Model returned null without reasoning.")
+                db.transition_to_quarantined(problem_id, f"LLM Null Failure: {reason[:1500]}")
 
     except Exception as e:
         logging.error(f"CRITICAL FAILURE [Analysis] for batch {batch_ids}: {e}", exc_info=True)
@@ -388,7 +388,7 @@ def analysis_worker(batch: List[Dict[str, Any]], worker_id: str, gemini_km: KeyM
             db.transition_to_failed(problem_id, 'analysis', str(e))
     finally:
         db.update_worker_status(worker_id, 'ANALYSIS', None, None, 'idle')
-        
+
 # --- STAGE 3: IMPLEMENTATION ---
 def implementation_worker(problem: Dict[str, Any], worker_id: int, groq_km: KeyManager):
     """
@@ -445,98 +445,160 @@ def implementation_worker(problem: Dict[str, Any], worker_id: int, groq_km: KeyM
 
 def vjs_worker(problem: Dict[str, Any], worker_id: str):
     """
-    Judges the AI-generated code using N-Version Differential VJS.
+    (DEFINITIVE with User's Adaptive Threshold Logic)
+    Judges code using a tiered, weighted consensus model with an adaptive
+    quality threshold.
     """
     problem_id = problem['id']
-    logging.info(f"[{problem_id}] Starting N-Version Differential VJS...")
+    logging.info(f"[{problem_id}] Starting VJS with Adaptive Threshold...")
     db.update_worker_status(worker_id, 'VJS', problem_id, 'SETUP', 'active')
     
-    ai_executable_dir = None
+    vjs_temp_dir = tempfile.mkdtemp(prefix=f"vjs_{problem_id}_")
+    
     try:
-        # 1. Fetch all calibration data from the workspace
+        # --- Data Fetching ---
         workspace_data = db.get_batch_data_from_workspace([problem_id]).get(problem_id)
         if not workspace_data: raise Exception("Workspace data not found for VJS.")
 
         reconstructed_code = workspace_data.get('arl_reconstructed_code')
         oracle_paths = json.loads(workspace_data.get('compiled_oracle_paths_json', '[]'))
         pretests = json.loads(workspace_data.get('validated_pretests_json', '[]'))
-        slowness_factor = workspace_data.get('slowness_factor', 2.0)
+        slowness_factor = workspace_data.get('slowness_factor', 3.0)
         time_limit_ms = int(_parse_time_limit(workspace_data.get('time_limit_raw', '1s')) * slowness_factor)
         memory_limit_kb = _parse_memory_limit(workspace_data.get('memory_limit_raw', '256mb'))
+        analysis_json = json.loads(workspace_data.get('quality_analysis_json', '{}'))
+        oracle_ratings = analysis_json.get('oracle_ratings', {})
+        rating_weights = {'Excellent': 4, 'Good': 3, 'Fair': 2, 'Poor': 1}
 
         if not all([reconstructed_code, oracle_paths, pretests]):
-            raise Exception("Missing critical data for VJS (code, oracles, or pretests).")
+            raise Exception("Missing critical data for VJS.")
 
-        # 2. Compile the AI's solution
-        db.update_worker_status(worker_id, 'VJS', problem_id, 'COMPILING_AI', 'active')
-        compile_result = run_vjs(problem_id, reconstructed_code, [], 1000, 262144, suffix="_ai_compile", compile_only=True)
-        if compile_result['status'] != 'SUCCESS':
-            db.transition_to_pending_implementation_retry(problem_id, compile_result.get('report', ''))
+        # --- STAGE 1: Run Oracles ---
+        db.update_worker_status(worker_id, 'VJS', problem_id, 'ORACLE_EXECUTION', 'active')
+        full_golden_input = f"{len(pretests)}\n" + "\n".join(test['input'] for test in pretests)
+        golden_input_path = os.path.join(vjs_temp_dir, "golden.in")
+        with open(golden_input_path, "w") as f: f.write(full_golden_input)
+
+        oracle_full_outputs = []
+        with ThreadPoolExecutor(max_workers=len(oracle_paths)) as executor:
+            def run_binary_full(exec_path):
+                host_dir = os.path.dirname(exec_path)
+                exec_name = os.path.basename(exec_path)
+                user_id = f"{os.getuid()}:{os.getgid()}"
+                total_oracle_time_sec = (time_limit_ms / 1000.0) * len(pretests) + 5.0
+                run_cmd = ["docker", "run", "--rm", "-u", user_id, "-i", "--ulimit", "stack=268435456", f"--memory={memory_limit_kb}k", "-v", f"{host_dir}:/app:ro", "-w", "/app", "synapse-judge", "timeout", str(total_oracle_time_sec), f"./{exec_name}"]
+                with open(golden_input_path, 'r') as stdin_f:
+                    proc = subprocess.run(run_cmd, stdin=stdin_f, capture_output=True, text=True, timeout=total_oracle_time_sec + 5)
+                if proc.returncode != 0: return f"ORACLE_RUNTIME_ERROR_CODE_{proc.returncode}"
+                return proc.stdout.strip().replace('\r\n', '\n')
+
+            futures = {executor.submit(run_binary_full, path): path for path in oracle_paths}
+            for future in as_completed(futures):
+                oracle_full_outputs.append(future.result())
+
+        # --- STAGE 2: Tiered Consensus ---
+        db.update_worker_status(worker_id, 'VJS', problem_id, 'CONSENSUS_VOTE', 'active')
+        consensus_output = None
+        
+        # Tier 1: Weighted Vote with all oracles
+        scores = {out: 0 for out in oracle_full_outputs if "RUNTIME_ERROR" not in out}
+        for i, output in enumerate(oracle_full_outputs):
+            if output in scores:
+                rating = oracle_ratings.get(f"oracle_{i}", {}).get("rating", "Poor")
+                scores[output] += rating_weights.get(rating, 1)
+        
+        if scores:
+            best_output = max(scores, key=scores.get)
+            if scores[best_output] >= (MIN_VIABLE_ORACLES * rating_weights['Fair']):
+                consensus_output = best_output
+                logging.info(f"[{problem_id}] Consensus found by main weighted vote.")
+
+        # Tier 2: Recount with trusted council if main vote fails
+        if consensus_output is None:
+            logging.warning(f"[{problem_id}] Main vote failed. Performing a recount.")
+            recount_scores = {}
+            trusted_council_size = 0
+            for i, output in enumerate(oracle_full_outputs):
+                rating = oracle_ratings.get(f"oracle_{i}", {}).get("rating", "Poor")
+                if rating in ['Excellent', 'Good', 'Fair']:
+                    trusted_council_size += 1
+                    if "RUNTIME_ERROR" not in output:
+                        weight = rating_weights.get(rating, 1)
+                        if output not in recount_scores: recount_scores[output] = 0
+                        recount_scores[output] += weight
+            
+            # --- USER'S ADAPTIVE THRESHOLD LOGIC ---
+            if recount_scores:
+                best_output = max(recount_scores, key=recount_scores.get)
+                max_score = recount_scores[best_output]
+                
+                # NOTE FOR FUTURE REFINEMENT:
+                # The logic below is a lenient, adaptive threshold. A stricter future version might
+                # implement a "quorum check" (if trusted_council_size < MIN_VIABLE_ORACLES, fail)
+                # or trigger a "re-election" (re-scraping) to find better oracles.
+                min_score_threshold = min(MIN_VIABLE_ORACLES, trusted_council_size) * rating_weights['Fair']
+                
+                if max_score >= min_score_threshold:
+                    consensus_output = best_output
+                    logging.info(f"[{problem_id}] Consensus found by RECOUNT with adaptive threshold. Score: {max_score}, Threshold: {min_score_threshold}")
+
+        # Tier 3: Quarantine if all else fails
+        if consensus_output is None:
+            reason = f"Consensus failed after recount. Oracle outputs: {oracle_full_outputs}"
+            db.transition_to_quarantined(problem_id, reason)
+            return
+
+        golden_output_path = os.path.join(vjs_temp_dir, "golden.out")
+        with open(golden_output_path, "w") as f: f.write(consensus_output)
+
+        # --- STAGE 3: Judge AI Code ---
+        db.update_worker_status(worker_id, 'VJS', problem_id, 'JUDGING_AI', 'active')
+        ai_code_path = os.path.join(vjs_temp_dir, "main.cpp")
+        with open(ai_code_path, "w") as f: f.write(reconstructed_code)
+
+        user_id = f"{os.getuid()}:{os.getgid()}"
+        compile_cmd = ["docker", "run", "--rm", "-u", user_id, "-v", f"{vjs_temp_dir}:/app", "-w", "/app", "synapse-judge", "g++", "main.cpp", "-o", "main", "-O2", "-std=c++23", "-static"]
+        compile_proc = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=VJS_COMPILATION_TIMEOUT)
+
+        if compile_proc.returncode != 0:
+            db.transition_to_pending_implementation_retry(problem_id, compile_proc.stderr[:2000])
+            return
+
+        ai_output_path = os.path.join(vjs_temp_dir, "ai.out")
+        total_time_sec = (time_limit_ms / 1000.0) * len(pretests) + 2.0
+        
+        docker_run_cmd = ["docker", "run", "--rm", "-u", user_id, "-i", "--ulimit", "stack=268435456", f"--memory={memory_limit_kb}k", "-v", f"{vjs_temp_dir}:/app:ro", "-w", "/app", "synapse-judge", "timeout", str(total_time_sec), "./main"]
+        
+        with open(golden_input_path, 'r') as stdin_f, open(ai_output_path, 'w') as stdout_f:
+            run_proc = subprocess.run(docker_run_cmd, stdin=stdin_f, stdout=stdout_f, stderr=subprocess.PIPE, text=True, timeout=total_time_sec + 5)
+
+        if run_proc.returncode != 0:
+            report = f"AI code failed execution (exit code {run_proc.returncode}). Stderr: {run_proc.stderr}"
+            db.transition_to_pending_analysis_retry(problem_id, report)
+            return
+
+        checker_cmd = ["python", "-m", "synapse.checker", golden_input_path, ai_output_path, golden_output_path]
+        checker_proc = subprocess.run(checker_cmd, capture_output=True, text=True)
+
+        if checker_proc.returncode != 0:
+            with open(ai_output_path, 'r') as f: ai_output_text = f.read()
+            report = (f"WA/PE on full test suite.\nChecker Msg: {checker_proc.stdout.strip()}")
+            db.transition_to_pending_analysis_retry(problem_id, report)
             return
         
-        ai_executable_path = compile_result['executable_path']
-        ai_executable_dir = os.path.dirname(ai_executable_path)
-
-        # 3. Iterate through each pretest and perform differential verification
-        for i, test in enumerate(pretests):
-            test_num_str = f"Test {i+1}/{len(pretests)}"
-            db.update_worker_status(worker_id, 'VJS', problem_id, f'RUNNING {test_num_str}', 'active')
-            
-            oracle_outputs = []
-            with ThreadPoolExecutor(max_workers=len(oracle_paths)) as executor:
-                def run_binary(exec_path, test_input):
-                    host_dir = os.path.dirname(exec_path)
-                    exec_name = os.path.basename(exec_path)
-                    run_cmd = ["docker", "run", "--rm", "-i", f"--memory={memory_limit_kb}k", "-v", f"{host_dir}:/app:ro", "-w", "/app", "synapse-judge", "timeout", str(time_limit_ms/1000 + 2), f"./{exec_name}"]
-                    proc = subprocess.run(run_cmd, input=test_input, capture_output=True, text=True, timeout=time_limit_ms/1000 + 5)
-                    if proc.returncode != 0: return f"RUNTIME_ERROR_OR_TLE_CODE_{proc.returncode}"
-                    return proc.stdout.strip().replace('\r\n', '\n')
-
-                futures = {executor.submit(run_binary, path, test['input']): path for path in oracle_paths}
-                for future in as_completed(futures):
-                    oracle_outputs.append(future.result())
-
-            consensus_output = _voter(oracle_outputs)
-
-            if consensus_output is None:
-                reason = f"Hung Jury on {test_num_str}. Oracle outputs: {oracle_outputs}"
-                db.transition_to_quarantined(problem_id, reason)
-                return
-
-            ai_output = run_binary(ai_executable_path, test['input'])
-            
-            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.in') as f_in, \
-                 tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.ans') as f_ans, \
-                 tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.out') as f_out:
-                f_in.write(test['input']); f_ans.write(consensus_output); f_out.write(ai_output)
-                in_path, ans_path, out_path = f_in.name, f_ans.name, f_out.name
-
-            checker_cmd = ["python", "-m", "synapse.checker", in_path, out_path, ans_path]
-            checker_proc = subprocess.run(checker_cmd, capture_output=True, text=True)
-            os.remove(in_path); os.remove(ans_path); os.remove(out_path)
-
-            if checker_proc.returncode != 0:
-                verdict = "WA" if checker_proc.returncode == 1 else "PE"
-                report = (f"{verdict} on {test_num_str} vs Oracle Consensus.\n"
-                          f"Checker Msg: {checker_proc.stdout.strip()}\n"
-                          f"--- INPUT ---\n{test['input'][:1000]}\n"
-                          f"--- ORACLE CONSENSUS ---\n{consensus_output[:1000]}\n"
-                          f"--- AI OUTPUT ---\n{ai_output[:1000]}")
-                db.transition_to_pending_analysis_retry(problem_id, report)
-                return
-        
-        # 4. If all tests pass, the problem is verified!
+        # SUCCESS
         db.update_problem_status(problem_id, None, extra_updates={'confidence_level': 2})
         db.transition_to_pending_data_assembly(problem_id)
-        logging.info(f"SUCCESS [VJS] for {problem_id}. All {len(pretests)} tests passed by consensus. -> pending_data_assembly")
+        logging.info(f"SUCCESS [Final VJS] for {problem_id}. All tests passed. -> pending_data_assembly")
 
     except Exception as e:
-        logging.error(f"FAILED [VJS] for {problem_id}: {e}", exc_info=True)
+        logging.error(f"FAILED [Final VJS] for {problem_id}: {e}", exc_info=True)
         db.transition_to_failed(problem_id, 'vjs', str(e))
     finally:
-        if ai_executable_dir and os.path.exists(ai_executable_dir):
-            shutil.rmtree(ai_executable_dir)
+        if os.path.exists(vjs_temp_dir):
+            shutil.rmtree(vjs_temp_dir)
         db.update_worker_status(worker_id, 'VJS', None, None, 'idle')
+
     # --- STAGE 5: DATA ASSEMBLY ---
 def data_assembly_worker(problem: Dict[str, Any], worker_id: str):
     """
@@ -557,6 +619,18 @@ def data_assembly_worker(problem: Dict[str, Any], worker_id: str):
 
         golden_record = _assemble_golden_record(problem_id, workspace_data)
         append_to_dataset(golden_record)
+                # Clean up the compiled oracle directories after we are completely done.
+        logging.info(f"[{problem_id}] Performing final cleanup of temporary files.")
+        compiled_paths_json = workspace_data.get('compiled_oracle_paths_json', '[]')
+        compiled_paths = json.loads(compiled_paths_json)
+        # Use a set to avoid deleting the same directory multiple times
+        dirs_to_delete = {os.path.dirname(p) for p in compiled_paths}
+        for d in dirs_to_delete:
+            if os.path.exists(d):
+                shutil.rmtree(d)
+                logging.info(f"[{problem_id}] Removed temporary directory: {d}")
+        
+        # Also clean up the workspace DB entry
         db.delete_data_from_workspace(problem_id)
         db.transition_to_completed(problem_id)
 

@@ -42,8 +42,11 @@ from synapse.config_manager import config_manager
 load_dotenv()
 GEMINI_API_KEYS: list[str] = [key.strip() for key in os.getenv('GEMINI_API_KEYS', '').split(',') if key.strip()]
 GROQ_API_KEYS: list[str] = [key.strip() for key in os.getenv('GROQ_API_KEYS', '').split(',') if key.strip()]
+DISABLE_INGESTION: bool = os.getenv('DISABLE_INGESTION', 'false').lower() == 'true'
 if not GEMINI_API_KEYS or not GROQ_API_KEYS:
     logging.warning("API keys not found in .env file. ARL workers may fail.")
+if DISABLE_INGESTION:
+    logging.info("DISABLE_INGESTION=true — running as DGX node (no scraping).")
 
 def key_health_monitor(stop_event: threading.Event, gemini_km: KeyManager, groq_km: KeyManager) -> None:
     """
@@ -133,20 +136,27 @@ def main(args: argparse.Namespace) -> None:
     active_pools = {}
     worker_counts = {}
 
-    # This mapping is static
+    # Stage definitions — ingestion/calibration excluded on DGX
     stage_definitions = {
-        'INGESTION': (ingestion_worker, ('browser_queue',)),
-        'CALIBRATION': (calibration_worker, ()), # FEATURE: Added calibration stage
         'ANALYSIS': (analysis_worker, ('gemini_key_manager',)),
         'IMPLEMENTATION': (implementation_worker, ('groq_key_manager',)),
         'VJS': (vjs_worker, ()),
         'DATA_ASSEMBLY': (data_assembly_worker, ()),
     }
+    if not DISABLE_INGESTION:
+        stage_definitions = {
+            'INGESTION': (ingestion_worker, ('browser_queue',)),
+            'CALIBRATION': (calibration_worker, ()),
+            **stage_definitions,
+        }
 
     try:
         # BUGFIX: The browser queue size must also be dynamic.
         # We will manage the browser queue manually based on the ingestion worker count.
+        # Only create/fill browser queue on laptop (ingestion enabled)
         browser_queue: Queue = Queue()
+        if DISABLE_INGESTION:
+            current_ingestion_workers = 0
 
         while not stop_event.is_set():
             # BUGFIX: Sync config from DB at the start of each cycle

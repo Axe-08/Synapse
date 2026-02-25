@@ -1,280 +1,383 @@
 # create_database.py
 """
-This script initializes the project's databases (progress.db and workspace.db).
-It creates all necessary tables with the correct schemas and populates the
-problems table from the Codeforces API and the dynamic_config table with
-default values. This script is intended to be run once at the beginning
-of a project deployment.
+Initializes the project's databases (SQLite or PostgreSQL).
+
+Usage:
+  python create_database.py            # SQLite (progress.db + workspace.db)
+  python create_database.py --postgres # PostgreSQL via DATABASE_URL
 """
-import sqlite3
-import requests
+import argparse
 import logging
-import time
 import os
+import time
 from datetime import datetime
+
+import requests
+
 from config import (
-    DEFAULT_INGESTION_WORKER_COUNT,
-    DEFAULT_ANALYSIS_WORKER_COUNT,
-    DEFAULT_IMPLEMENTATION_WORKER_COUNT,
-    DEFAULT_VJS_WORKER_COUNT,
-    DEFAULT_DATA_ASSEMBLY_WORKER_COUNT,
-    DEFAULT_ANALYSIS_BATCH_SIZE,
-    DEFAULT_SCRAPER_DELAY_SECONDS, # BUGFIX: Added import
-    PROGRESS_DB_NAME,
-    WORKSPACE_DB_PATH,
-    API_URL,
-    # BUGFIX: Import MAX values for worker initialization
-    MAX_INGESTION_WORKERS,
-    MAX_ANALYSIS_WORKERS,
-    MAX_IMPLEMENTATION_WORKERS,
-    MAX_VJS_WORKERS,
-    MAX_DATA_ASSEMBLY_WORKERS,
+    DEFAULT_INGESTION_WORKER_COUNT, DEFAULT_ANALYSIS_WORKER_COUNT,
+    DEFAULT_IMPLEMENTATION_WORKER_COUNT, DEFAULT_VJS_WORKER_COUNT,
+    DEFAULT_DATA_ASSEMBLY_WORKER_COUNT, DEFAULT_ANALYSIS_BATCH_SIZE,
+    DEFAULT_SCRAPER_DELAY_SECONDS, PROGRESS_DB_NAME, WORKSPACE_DB_PATH,
+    API_URL, MAX_INGESTION_WORKERS, MAX_ANALYSIS_WORKERS,
+    MAX_IMPLEMENTATION_WORKERS, MAX_VJS_WORKERS, MAX_DATA_ASSEMBLY_WORKERS,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Schemas ---
-# -- progress.db Schemas --
-CREATE_PROBLEMS_TABLE_SQL: str = """
+_DATABASE_URL = os.getenv('DATABASE_URL', '')
+
+# ── Progress schema ──────────────────────────────────────────────────────────
+
+PROGRESS_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS problems (
     id TEXT PRIMARY KEY,
-    contest_id INTEGER NOT NULL,
-    problem_index TEXT NOT NULL,
-    name TEXT NOT NULL,
-    rating INTEGER,
-    tags TEXT,
+    contest_id INTEGER NOT NULL DEFAULT 0,
+    problem_index TEXT NOT NULL DEFAULT 'A',
+    name TEXT NOT NULL DEFAULT '',
+    rating INTEGER DEFAULT 0,
+    tags TEXT DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending_ingestion',
+    priority INTEGER NOT NULL DEFAULT 0,
     retry_count INTEGER DEFAULT 0,
     analysis_try_count INTEGER DEFAULT 0,
     implementation_try_count INTEGER DEFAULT 0,
     rescraping_attempts INTEGER DEFAULT 0,
     tried_submission_ids TEXT,
-    reference_submissions_json TEXT,     -- ADD: Stores the JSON array of N submission objects.
-    successful_oracles INTEGER DEFAULT 0,  -- ADD: Caches the count of compiled oracles.
-    confidence_level INTEGER DEFAULT 0,    -- ADD: 0=pending, 1=calibrated, 2=differentially verified
+    reference_submissions_json TEXT,
+    successful_oracles INTEGER DEFAULT 0,
+    confidence_level INTEGER DEFAULT 0,
     last_vjs_report TEXT,
     notes TEXT,
-    last_updated TEXT NOT NULL
+    last_updated TEXT NOT NULL DEFAULT now()
 );
-"""
-CREATE_WORKERS_TABLE_SQL: str = """
+
 CREATE TABLE IF NOT EXISTS live_workers (
-    worker_id TEXT PRIMARY KEY, -- BUGFIX: Changed to TEXT to support "POOL-ID" format
+    worker_id TEXT PRIMARY KEY,
     pool TEXT NOT NULL,
     problem_id TEXT,
     stage TEXT,
     status TEXT NOT NULL DEFAULT 'idle',
-    last_heartbeat TEXT NOT NULL
+    last_heartbeat TEXT NOT NULL DEFAULT now()
 );
-"""
-CREATE_KEY_STATUS_TABLE_SQL: str = """
+
 CREATE TABLE IF NOT EXISTS key_status (
     key_fingerprint TEXT PRIMARY KEY,
     service TEXT NOT NULL,
-    status TEXT NOT NULL, -- AVAILABLE, RATE_LIMITED, EXHAUSTED, INVALID
-    cooldown_until REAL
+    status TEXT NOT NULL DEFAULT 'AVAILABLE',
+    cooldown_until REAL DEFAULT 0.0
 );
-"""
-CREATE_PROCESS_HISTORY_TABLE_SQL: str = """
+
 CREATE TABLE IF NOT EXISTS process_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
+    id SERIAL PRIMARY KEY,
+    timestamp TEXT NOT NULL DEFAULT now(),
     problem_id TEXT NOT NULL,
     stage TEXT NOT NULL,
-    event_type TEXT NOT NULL, -- e.g., 'START', 'SUCCESS', 'FAILURE', 'RETRY_LOGIC'
+    event_type TEXT NOT NULL,
     details TEXT
 );
-"""
-CREATE_METRICS_TABLE_SQL: str = """
+
 CREATE TABLE IF NOT EXISTS metrics (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
+    id SERIAL PRIMARY KEY,
+    timestamp TEXT NOT NULL DEFAULT now(),
     worker_pool TEXT NOT NULL,
     event_type TEXT NOT NULL,
     duration_ms INTEGER,
-    success BOOLEAN NOT NULL,
+    success BOOLEAN NOT NULL DEFAULT FALSE,
     details_json TEXT
 );
-"""
-CREATE_DYNAMIC_CONFIG_TABLE_SQL: str = """
+
 CREATE TABLE IF NOT EXISTS dynamic_config (
     key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    last_updated TEXT NOT NULL
+    value TEXT NOT NULL DEFAULT '',
+    last_updated TEXT NOT NULL DEFAULT now()
 );
 """
-# -- workspace.db Schema --
-CREATE_WORKSPACE_TABLE_SQL: str = """
+
+WORKSPACE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS problem_data_cache (
     problem_id TEXT PRIMARY KEY,
     problem_statement_html TEXT,
-    reference_solution_json TEXT,          -- Metadata for the primary (highest-rated) oracle.
-    reference_solution_code TEXT,          -- Source code for the primary oracle.
-    secondary_reference_codes_json TEXT, -- ADD: JSON array of codes for oracles 2 through N.
-    compiled_oracle_paths_json TEXT,     -- ADD: Stores paths to compiled binaries for the VJS worker.
-    pretests_json TEXT,
-    validated_pretests_json TEXT,        -- ADD: Stores pretests verified during calibration.
-    slowness_factor REAL,                  -- ADD: Stores the calculated local vs. official judge speed ratio.
-    checker_mode TEXT,                     -- ADD: Stores 'strict' or 'set_based' validation rule.
+    reference_solution_json TEXT,
+    reference_solution_code TEXT,
+    secondary_reference_codes_json TEXT DEFAULT '[]',
+    compiled_oracle_paths_json TEXT DEFAULT '[]',
+    pretests_json TEXT DEFAULT '[]',
+    validated_pretests_json TEXT DEFAULT '[]',
+    slowness_factor REAL DEFAULT 3.0,
+    checker_mode TEXT DEFAULT 'strict',
     arl_pseudocode TEXT,
     arl_reconstructed_code TEXT,
     arl_feedback TEXT,
     vjs_last_report TEXT,
-    quality_analysis_json TEXT,
-    time_limit_raw TEXT,                -- ADD THIS LINE
-    memory_limit_raw TEXT               -- ADD THIS LINE
+    quality_analysis_json TEXT DEFAULT '{}',
+    time_limit_raw TEXT DEFAULT '2 seconds',
+    memory_limit_raw TEXT DEFAULT '256 megabytes'
 );
 """
 
-def populate_problems_table(cursor: sqlite3.Cursor) -> bool:
-    """
-    Fetches all problems from the Codeforces API and inserts them into progress.db.
-    Args:
-        cursor: The database cursor for progress.db.
-    Returns:
-        True if successful, False otherwise.
-    """
+# ── SQLite-compatible variants (default() → literals, SERIAL → AUTOINCREMENT)
+SQLITE_PROGRESS_TABLES_SQL = PROGRESS_TABLES_SQL \
+    .replace("DEFAULT now()", "DEFAULT (datetime('now'))") \
+    .replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT") \
+    .replace("BOOLEAN NOT NULL DEFAULT FALSE", "INTEGER NOT NULL DEFAULT 0")
+
+SQLITE_WORKSPACE_TABLES_SQL = WORKSPACE_TABLES_SQL
+
+
+# ── PostgreSQL setup ─────────────────────────────────────────────────────────
+
+def _pg_setup(database_url: str) -> None:
+    import psycopg2
+
+    conn = psycopg2.connect(database_url)
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    # Create schemas
+    cur.execute("CREATE SCHEMA IF NOT EXISTS progress;")
+    cur.execute("CREATE SCHEMA IF NOT EXISTS workspace;")
+
+    # Progress tables
+    cur.execute("SET search_path TO progress;")
+    cur.execute(PROGRESS_TABLES_SQL)
+    logging.info("PostgreSQL progress schema created.")
+
+    # Add priority column if upgrading from old schema
+    cur.execute("""
+        ALTER TABLE progress.problems
+        ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 0;
+    """)
+
+    # Workspace tables
+    cur.execute("SET search_path TO workspace;")
+    cur.execute(WORKSPACE_TABLES_SQL)
+    logging.info("PostgreSQL workspace schema created.")
+
+    conn.close()
+
+
+def _pg_populate_problems(database_url: str) -> bool:
+    """Fetches problems from CF API and inserts them into PostgreSQL."""
+    import psycopg2
+    import psycopg2.extras
+
     logging.info("Fetching problem list from Codeforces API...")
     try:
-        response = requests.get(API_URL, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-    except requests.exceptions.RequestException as e:
-        logging.critical(f"Failed to fetch data from Codeforces API: {e}")
+        resp = requests.get(API_URL, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logging.critical(f"Failed to fetch from CF API: {e}")
         return False
 
     if data.get('status') != 'OK':
-        logging.critical(f"API returned non-OK status: {data.get('comment')}")
+        logging.critical(f"CF API error: {data.get('comment')}")
         return False
 
     problems = data['result']['problems']
-    problems_to_insert = []
+    rows = []
+    now = datetime.now().isoformat()
     for p in problems:
-        if 'rating' not in p: continue
-        problem_id = f"{p['contestId']}{p['index']}"
+        if 'rating' not in p:
+            continue
+        pid = f"{p['contestId']}{p['index']}"
         tags = ", ".join(p.get('tags', []))
-        timestamp = datetime.now().isoformat()
-        problems_to_insert.append((problem_id, p['contestId'], p['index'], p['name'], p['rating'], tags, timestamp))
+        rows.append((pid, p['contestId'], p['index'], p['name'], p['rating'], tags, now))
 
+    conn = psycopg2.connect(database_url, options="-c search_path=progress")
+    conn.autocommit = False
     try:
-        cursor.executemany(
-            "INSERT INTO problems (id, contest_id, problem_index, name, rating, tags, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            problems_to_insert
-        )
-        logging.info(f"Successfully inserted {cursor.rowcount} new problems into progress.db.")
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                """INSERT INTO problems (id, contest_id, problem_index, name, rating, tags, last_updated)
+                   VALUES %s ON CONFLICT (id) DO NOTHING""",
+                rows
+            )
+        conn.commit()
+        logging.info(f"Inserted {len(rows)} problems into PostgreSQL.")
         return True
-    except sqlite3.Error as e:
-        logging.error(f"Failed to bulk insert problems: {e}")
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Failed to insert problems: {e}")
         return False
+    finally:
+        conn.close()
 
-def initialize_workers_table(cursor: sqlite3.Cursor) -> None:
-    """
-    (BUGFIX) Sets up the initial rows for the MAX number of possible workers
-    across all pools. This ensures the dashboard has a row for every potential
-    worker the optimizer might activate.
-    Args:
-        cursor: The database cursor for progress.db.
-    """
-    timestamp = datetime.now().isoformat()
-    workers = []
-    
-    # BUGFIX: Use a dictionary of MAX worker counts to initialize the table
+
+def _pg_init_workers(database_url: str) -> None:
+    import psycopg2
+    now = datetime.now().isoformat()
     pools = {
         'INGESTION': MAX_INGESTION_WORKERS,
         'ANALYSIS': MAX_ANALYSIS_WORKERS,
         'IMPLEMENTATION': MAX_IMPLEMENTATION_WORKERS,
         'VJS': MAX_VJS_WORKERS,
-        'DATA_ASSEMBLY': MAX_DATA_ASSEMBLY_WORKERS
+        'DATA_ASSEMBLY': MAX_DATA_ASSEMBLY_WORKERS,
     }
-    total_slots = sum(pools.values())
-    logging.info(f"Initializing {total_slots} total worker slots in database...")
+    workers = []
+    for pool, count in pools.items():
+        for i in range(1, count + 1):
+            workers.append((f"{pool}-{i}", pool, 'idle', now))
 
-    for pool_name, max_count in pools.items():
-        for i in range(1, max_count + 1):
-            # Create a unique ID like "ANALYSIS-1", "ANALYSIS-2"
-            worker_id = f"{pool_name}-{i}"
-            workers.append((worker_id, pool_name, 'idle', timestamp))
-            
-    try:
-        cursor.executemany("INSERT OR REPLACE INTO live_workers (worker_id, pool, status, last_heartbeat) VALUES (?, ?, ?, ?)", workers)
-        logging.info("Worker slots initialized successfully.")
-    except sqlite3.Error as e:
-        logging.error(f"Failed to initialize worker slots: {e}")
+    conn = psycopg2.connect(database_url, options="-c search_path=progress")
+    conn.autocommit = False
+    with conn.cursor() as cur:
+        for wid, pool, status, ts in workers:
+            cur.execute(
+                """INSERT INTO live_workers (worker_id, pool, status, last_heartbeat)
+                   VALUES (%s, %s, %s, %s) ON CONFLICT (worker_id) DO NOTHING""",
+                (wid, pool, status, ts)
+            )
+    conn.commit()
+    conn.close()
+    logging.info("Worker slots initialized in PostgreSQL.")
 
-def populate_initial_dynamic_config(cursor: sqlite3.Cursor) -> None:
-    """
-    Sets the default values for the dynamic_config table in progress.db.
-    Args:
-        cursor: The database cursor for progress.db.
-    """
-    logging.info("Populating dynamic_config with default values...")
-    timestamp = datetime.now().isoformat()
-    default_configs = [
-        ('ingestion_worker_count', str(DEFAULT_INGESTION_WORKER_COUNT), timestamp),
-        ('analysis_worker_count', str(DEFAULT_ANALYSIS_WORKER_COUNT), timestamp),
-        ('implementation_worker_count', str(DEFAULT_IMPLEMENTATION_WORKER_COUNT), timestamp),
-        ('vjs_worker_count', str(DEFAULT_VJS_WORKER_COUNT), timestamp),
-        ('data_assembly_worker_count', str(DEFAULT_DATA_ASSEMBLY_WORKER_COUNT), timestamp),
-        ('analysis_batch_size', str(DEFAULT_ANALYSIS_BATCH_SIZE), timestamp),
-        ('scraper_delay_seconds', str(DEFAULT_SCRAPER_DELAY_SECONDS), timestamp), # BUGFIX: Correctly reference variable
+
+def _pg_init_dynamic_config(database_url: str) -> None:
+    import psycopg2
+    now = datetime.now().isoformat()
+    configs = [
+        ('ingestion_worker_count', str(DEFAULT_INGESTION_WORKER_COUNT), now),
+        ('analysis_worker_count', str(DEFAULT_ANALYSIS_WORKER_COUNT), now),
+        ('implementation_worker_count', str(DEFAULT_IMPLEMENTATION_WORKER_COUNT), now),
+        ('vjs_worker_count', str(DEFAULT_VJS_WORKER_COUNT), now),
+        ('data_assembly_worker_count', str(DEFAULT_DATA_ASSEMBLY_WORKER_COUNT), now),
+        ('analysis_batch_size', str(DEFAULT_ANALYSIS_BATCH_SIZE), now),
+        ('scraper_delay_seconds', str(DEFAULT_SCRAPER_DELAY_SECONDS), now),
     ]
-    try:
-        cursor.executemany(
-            "INSERT OR REPLACE INTO dynamic_config (key, value, last_updated) VALUES (?, ?, ?)",
-            default_configs
-        )
-        logging.info("Default dynamic configuration set successfully.")
-    except sqlite3.Error as e:
-        logging.error(f"Failed to set default dynamic config: {e}")
+    conn = psycopg2.connect(database_url, options="-c search_path=progress")
+    conn.autocommit = False
+    with conn.cursor() as cur:
+        for key, val, ts in configs:
+            cur.execute(
+                """INSERT INTO dynamic_config (key, value, last_updated)
+                   VALUES (%s, %s, %s) ON CONFLICT (key) DO NOTHING""",
+                (key, val, ts)
+            )
+    conn.commit()
+    conn.close()
+    logging.info("Default dynamic config inserted into PostgreSQL.")
 
-def main() -> None:
-    """Main function to set up and populate both databases."""
+
+# ── SQLite setup ─────────────────────────────────────────────────────────────
+
+def _sqlite_setup() -> None:
+    import sqlite3
+
     for db_name in [PROGRESS_DB_NAME, WORKSPACE_DB_PATH]:
         if os.path.exists(db_name):
-            logging.warning(f"Database '{db_name}' already exists.")
-            response = input(f"This script will DELETE and re-create '{db_name}'. Continue? (y/n): ").lower()
-            if response != 'y':
-                logging.info("Operation cancelled by user.")
+            resp = input(f"'{db_name}' already exists. Delete and recreate? (y/n): ").lower()
+            if resp != 'y':
+                logging.info("Cancelled.")
                 return
-            try:
-                os.remove(db_name)
-                logging.info(f"Removed existing database '{db_name}'.")
-            except OSError as e:
-                logging.critical(f"Error removing existing database: {e}")
-                return
+            os.remove(db_name)
 
-    # Setup progress.db
-    try:
-        logging.info(f"Setting up '{PROGRESS_DB_NAME}'...")
-        with sqlite3.connect(PROGRESS_DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL;")
-            cursor.execute(CREATE_PROBLEMS_TABLE_SQL)
-            cursor.execute(CREATE_WORKERS_TABLE_SQL)
-            cursor.execute(CREATE_KEY_STATUS_TABLE_SQL)
-            cursor.execute(CREATE_PROCESS_HISTORY_TABLE_SQL)
-            cursor.execute(CREATE_METRICS_TABLE_SQL)
-            cursor.execute(CREATE_DYNAMIC_CONFIG_TABLE_SQL)
-            if populate_problems_table(cursor):
-                initialize_workers_table(cursor)
-                populate_initial_dynamic_config(cursor)
-                logging.info(f"'{PROGRESS_DB_NAME}' setup complete.")
-            else:
-                raise Exception("Failed to populate problems table.")
-    except Exception as e:
-        logging.critical(f"A critical error occurred with {PROGRESS_DB_NAME}: {e}")
-        return
+    with sqlite3.connect(PROGRESS_DB_NAME) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.executescript(SQLITE_PROGRESS_TABLES_SQL)
+        _sqlite_populate_problems(conn.cursor())
+        _sqlite_init_workers(conn.cursor())
+        _sqlite_init_dynamic_config(conn.cursor())
+        conn.commit()
+    logging.info(f"'{PROGRESS_DB_NAME}' setup complete.")
 
-    # Setup workspace.db
+    with sqlite3.connect(WORKSPACE_DB_PATH) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.executescript(SQLITE_WORKSPACE_TABLES_SQL)
+        conn.commit()
+    logging.info(f"'{WORKSPACE_DB_PATH}' setup complete.")
+
+
+def _sqlite_populate_problems(cursor) -> bool:
+    import sqlite3
+    logging.info("Fetching problem list from Codeforces API...")
     try:
-        logging.info(f"Setting up '{WORKSPACE_DB_PATH}'...")
-        with sqlite3.connect(WORKSPACE_DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL;")
-            cursor.execute(CREATE_WORKSPACE_TABLE_SQL)
-            logging.info(f"'{WORKSPACE_DB_PATH}' setup complete.")
+        resp = requests.get(API_URL, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as e:
-        logging.critical(f"A critical error occurred with {WORKSPACE_DB_PATH}: {e}")
+        logging.critical(f"Failed to fetch from CF API: {e}")
+        return False
+    now = datetime.now().isoformat()
+    rows = []
+    for p in data['result']['problems']:
+        if 'rating' not in p:
+            continue
+        pid = f"{p['contestId']}{p['index']}"
+        rows.append((pid, p['contestId'], p['index'], p['name'],
+                     p['rating'], ", ".join(p.get('tags', [])), now))
+    try:
+        cursor.executemany(
+            "INSERT OR IGNORE INTO problems (id, contest_id, problem_index, name, rating, tags, last_updated) VALUES (?,?,?,?,?,?,?)",
+            rows
+        )
+        logging.info(f"Inserted {cursor.rowcount} problems.")
+        return True
+    except sqlite3.Error as e:
+        logging.error(f"Failed to bulk insert: {e}")
+        return False
+
+
+def _sqlite_init_workers(cursor) -> None:
+    now = datetime.now().isoformat()
+    pools = {
+        'INGESTION': MAX_INGESTION_WORKERS, 'ANALYSIS': MAX_ANALYSIS_WORKERS,
+        'IMPLEMENTATION': MAX_IMPLEMENTATION_WORKERS, 'VJS': MAX_VJS_WORKERS,
+        'DATA_ASSEMBLY': MAX_DATA_ASSEMBLY_WORKERS,
+    }
+    workers = [(f"{p}-{i}", p, 'idle', now)
+               for p, n in pools.items() for i in range(1, n + 1)]
+    cursor.executemany(
+        "INSERT OR REPLACE INTO live_workers (worker_id, pool, status, last_heartbeat) VALUES (?,?,?,?)",
+        workers
+    )
+    logging.info("Worker slots initialized.")
+
+
+def _sqlite_init_dynamic_config(cursor) -> None:
+    now = datetime.now().isoformat()
+    configs = [
+        ('ingestion_worker_count', str(DEFAULT_INGESTION_WORKER_COUNT), now),
+        ('analysis_worker_count', str(DEFAULT_ANALYSIS_WORKER_COUNT), now),
+        ('implementation_worker_count', str(DEFAULT_IMPLEMENTATION_WORKER_COUNT), now),
+        ('vjs_worker_count', str(DEFAULT_VJS_WORKER_COUNT), now),
+        ('data_assembly_worker_count', str(DEFAULT_DATA_ASSEMBLY_WORKER_COUNT), now),
+        ('analysis_batch_size', str(DEFAULT_ANALYSIS_BATCH_SIZE), now),
+        ('scraper_delay_seconds', str(DEFAULT_SCRAPER_DELAY_SECONDS), now),
+    ]
+    cursor.executemany(
+        "INSERT OR REPLACE INTO dynamic_config (key, value, last_updated) VALUES (?,?,?)",
+        configs
+    )
+    logging.info("Default dynamic config set.")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Initialize Synapse databases.")
+    parser.add_argument('--postgres', action='store_true',
+                        help='Initialize PostgreSQL (requires DATABASE_URL env var)')
+    args = parser.parse_args()
+
+    if args.postgres:
+        url = _DATABASE_URL
+        if not url:
+            logging.critical("DATABASE_URL not set. Cannot initialize PostgreSQL.")
+            return
+        logging.info(f"Setting up PostgreSQL at {url.split('@')[-1]}...")
+        _pg_setup(url)
+        if _pg_populate_problems(url):
+            _pg_init_workers(url)
+            _pg_init_dynamic_config(url)
+            logging.info("PostgreSQL setup complete.")
+        else:
+            logging.error("Problem population failed. Setup incomplete.")
+    else:
+        _sqlite_setup()
+
 
 if __name__ == "__main__":
     main()

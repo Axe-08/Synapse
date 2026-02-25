@@ -86,7 +86,7 @@ def run_vjs(problem_id: str, code: str, pretests: List[Dict], time_limit_ms: int
 
             timeout_sec = (time_limit_ms / 1000.0) + 2.0
             run_cmd_inside = f"/usr/bin/time -f \"%e\" ./main"
-            docker_run_cmd = ["docker", "run", "--rm","-u",user_id, "-i", "--memory", f"{memory_limit_kb}k", "-v", f"{abs_host_dir}:/app:ro", "-w", "/app", "synapse-judge", "timeout", str(timeout_sec), "/bin/sh", "-c", run_cmd_inside]
+            docker_run_cmd = ["docker", "run", "--rm","-u",user_id, "-i","--ulimit", "stack=268435456", "--memory", f"{memory_limit_kb}k", "-v", f"{abs_host_dir}:/app:ro", "-w", "/app", "synapse-judge", "timeout", str(timeout_sec), "/bin/sh", "-c", run_cmd_inside]
 
             with open(input_path, 'r') as stdin_f, open(output_path, 'w') as stdout_f:
                 try:
