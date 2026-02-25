@@ -1,0 +1,28 @@
+# requirements-pipeline.txt
+# DGX pipeline dependencies — excludes DVC, Selenium/Chrome, and DVC cloud deps
+# Use: venv/bin/pip install -r requirements-pipeline.txt
+
+# Core runtime
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Database
+psycopg2-binary>=2.9
+
+# Google Gemini (analysis worker)
+google-generativeai>=0.8.0
+
+# Groq (implementation worker)
+groq>=0.11.0
+
+# HTML parsing (ingestion/assembly)
+beautifulsoup4>=4.12.0
+
+# Code quality analysis
+lizard>=1.17.0
+
+# Codeforces judging deps (docker subprocess calls)
+# docker package not needed — we shell out to docker CLI
+
+# Utilities
+lizard>=1.17.0
