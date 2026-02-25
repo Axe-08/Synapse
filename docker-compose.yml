@@ -15,7 +15,7 @@ services:
     volumes:
       - /home/23uec552/synapse-pg-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U synapse -d synapse_db"]
+      test: [ "CMD-SHELL", "pg_isready -U synapse -d synapse_db" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -37,11 +37,12 @@ services:
       - DATABASE_URL=postgresql://synapse:synapse@postgres:5432/synapse_db
       - DISABLE_INGESTION=true
     env_file:
-      - .env                 # GEMINI_API_KEYS, GROQ_API_KEYS, etc.
+      - path: .env
+        required: false # GEMINI_API_KEYS, GROQ_API_KEYS — create manually on DGX
     volumes:
       - /home/23uec552/Synapse/data:/app/data
       - /home/23uec552/Synapse/dataset.jsonl:/app/dataset.jsonl
       - /home/23uec552/synapse-judge-bin:/synapse-judge-bin:ro
       - /var/run/docker.sock:/var/run/docker.sock
     working_dir: /app
-    command: ["python", "main.py"]
+    command: [ "python", "main.py" ]
