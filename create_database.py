@@ -17,10 +17,14 @@ import requests
 from config import (
     DEFAULT_INGESTION_WORKER_COUNT, DEFAULT_ANALYSIS_WORKER_COUNT,
     DEFAULT_IMPLEMENTATION_WORKER_COUNT, DEFAULT_VJS_WORKER_COUNT,
-    DEFAULT_DATA_ASSEMBLY_WORKER_COUNT, DEFAULT_ANALYSIS_BATCH_SIZE,
-    DEFAULT_SCRAPER_DELAY_SECONDS, PROGRESS_DB_NAME, WORKSPACE_DB_PATH,
-    API_URL, MAX_INGESTION_WORKERS, MAX_ANALYSIS_WORKERS,
-    MAX_IMPLEMENTATION_WORKERS, MAX_VJS_WORKERS, MAX_DATA_ASSEMBLY_WORKERS,
+    DEFAULT_CF_SUBMISSION_WORKER_COUNT, DEFAULT_DATA_ASSEMBLY_WORKER_COUNT,
+    DEFAULT_ANALYSIS_BATCH_SIZE, DEFAULT_SCRAPER_DELAY_SECONDS,
+    PROGRESS_DB_NAME, WORKSPACE_DB_PATH, API_URL,
+    MAX_INGESTION_WORKERS, MAX_ANALYSIS_WORKERS,
+    MAX_IMPLEMENTATION_WORKERS, MAX_VJS_WORKERS,
+    MAX_CF_SUBMISSION_WORKERS, MAX_DATA_ASSEMBLY_WORKERS,
+    MAX_FUZZ_GENERATOR_WORKERS, DEFAULT_FUZZ_GENERATOR_WORKER_COUNT,
+    DEFAULT_FUZZ_BATCH_SIZE
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -47,6 +51,8 @@ CREATE TABLE IF NOT EXISTS problems (
     reference_submissions_json TEXT,
     successful_oracles INTEGER DEFAULT 0,
     confidence_level INTEGER DEFAULT 0,
+    problem_class TEXT NOT NULL DEFAULT 'standard',
+    submission_account TEXT,
     last_vjs_report TEXT,
     notes TEXT,
     last_updated TEXT NOT NULL DEFAULT now()
@@ -92,6 +98,25 @@ CREATE TABLE IF NOT EXISTS dynamic_config (
     value TEXT NOT NULL DEFAULT '',
     last_updated TEXT NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS scraper_stats (
+    id SERIAL PRIMARY KEY,
+    account TEXT NOT NULL,
+    timestamp TEXT NOT NULL DEFAULT now(),
+    event_type TEXT NOT NULL,
+    details_json TEXT DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS dgx_usage_stats (
+    id SERIAL PRIMARY KEY,
+    timestamp TEXT NOT NULL DEFAULT now(),
+    hour INTEGER NOT NULL,
+    weekday INTEGER NOT NULL,
+    cpu_percent REAL,
+    ram_percent REAL,
+    our_active_workers INTEGER,
+    queue_depth INTEGER
+);
 """
 
 WORKSPACE_TABLES_SQL = """
@@ -112,7 +137,9 @@ CREATE TABLE IF NOT EXISTS problem_data_cache (
     vjs_last_report TEXT,
     quality_analysis_json TEXT DEFAULT '{}',
     time_limit_raw TEXT DEFAULT '2 seconds',
-    memory_limit_raw TEXT DEFAULT '256 megabytes'
+    memory_limit_raw TEXT DEFAULT '256 megabytes',
+    input_generator_py TEXT,
+    generated_tests_json TEXT DEFAULT '[]'
 );
 """
 
@@ -212,8 +239,10 @@ def _pg_init_workers(database_url: str) -> None:
     pools = {
         'INGESTION': MAX_INGESTION_WORKERS,
         'ANALYSIS': MAX_ANALYSIS_WORKERS,
+        'FUZZ_GENERATOR': MAX_FUZZ_GENERATOR_WORKERS,
         'IMPLEMENTATION': MAX_IMPLEMENTATION_WORKERS,
         'VJS': MAX_VJS_WORKERS,
+        'CF_SUBMISSION': MAX_CF_SUBMISSION_WORKERS,
         'DATA_ASSEMBLY': MAX_DATA_ASSEMBLY_WORKERS,
     }
     workers = []
@@ -241,10 +270,13 @@ def _pg_init_dynamic_config(database_url: str) -> None:
     configs = [
         ('ingestion_worker_count', str(DEFAULT_INGESTION_WORKER_COUNT), now),
         ('analysis_worker_count', str(DEFAULT_ANALYSIS_WORKER_COUNT), now),
+        ('fuzz_generator_worker_count', str(DEFAULT_FUZZ_GENERATOR_WORKER_COUNT), now),
         ('implementation_worker_count', str(DEFAULT_IMPLEMENTATION_WORKER_COUNT), now),
         ('vjs_worker_count', str(DEFAULT_VJS_WORKER_COUNT), now),
+        ('cf_submission_worker_count', str(DEFAULT_CF_SUBMISSION_WORKER_COUNT), now),
         ('data_assembly_worker_count', str(DEFAULT_DATA_ASSEMBLY_WORKER_COUNT), now),
         ('analysis_batch_size', str(DEFAULT_ANALYSIS_BATCH_SIZE), now),
+        ('fuzz_batch_size', str(DEFAULT_FUZZ_BATCH_SIZE), now),
         ('scraper_delay_seconds', str(DEFAULT_SCRAPER_DELAY_SECONDS), now),
     ]
     conn = psycopg2.connect(database_url, options="-c search_path=progress")
@@ -324,8 +356,9 @@ def _sqlite_init_workers(cursor) -> None:
     now = datetime.now().isoformat()
     pools = {
         'INGESTION': MAX_INGESTION_WORKERS, 'ANALYSIS': MAX_ANALYSIS_WORKERS,
+        'FUZZ_GENERATOR': MAX_FUZZ_GENERATOR_WORKERS,
         'IMPLEMENTATION': MAX_IMPLEMENTATION_WORKERS, 'VJS': MAX_VJS_WORKERS,
-        'DATA_ASSEMBLY': MAX_DATA_ASSEMBLY_WORKERS,
+        'CF_SUBMISSION': MAX_CF_SUBMISSION_WORKERS, 'DATA_ASSEMBLY': MAX_DATA_ASSEMBLY_WORKERS,
     }
     workers = [(f"{p}-{i}", p, 'idle', now)
                for p, n in pools.items() for i in range(1, n + 1)]
@@ -341,10 +374,13 @@ def _sqlite_init_dynamic_config(cursor) -> None:
     configs = [
         ('ingestion_worker_count', str(DEFAULT_INGESTION_WORKER_COUNT), now),
         ('analysis_worker_count', str(DEFAULT_ANALYSIS_WORKER_COUNT), now),
+        ('fuzz_generator_worker_count', str(DEFAULT_FUZZ_GENERATOR_WORKER_COUNT), now),
         ('implementation_worker_count', str(DEFAULT_IMPLEMENTATION_WORKER_COUNT), now),
         ('vjs_worker_count', str(DEFAULT_VJS_WORKER_COUNT), now),
+        ('cf_submission_worker_count', str(DEFAULT_CF_SUBMISSION_WORKER_COUNT), now),
         ('data_assembly_worker_count', str(DEFAULT_DATA_ASSEMBLY_WORKER_COUNT), now),
         ('analysis_batch_size', str(DEFAULT_ANALYSIS_BATCH_SIZE), now),
+        ('fuzz_batch_size', str(DEFAULT_FUZZ_BATCH_SIZE), now),
         ('scraper_delay_seconds', str(DEFAULT_SCRAPER_DELAY_SECONDS), now),
     ]
     cursor.executemany(

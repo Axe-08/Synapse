@@ -31,12 +31,15 @@ from synapse.workers import (
     ingestion_worker,
     calibration_worker, # FEATURE: Added calibration worker
     analysis_worker,
+    fuzz_generator_worker,
     implementation_worker,
     vjs_worker,
+    cf_submission_worker,
     data_assembly_worker
 )
 from synapse.database_writer import db_writer
 from synapse.config_manager import config_manager
+from synapse.optimizer import PipelineOptimizer
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -81,8 +84,10 @@ def manage_pools(current_pools: dict, current_counts: dict) -> tuple[dict, dict]
         'INGESTION': config_manager.get_param('ingestion_worker_count'),
         'CALIBRATION': config_manager.get_param('ingestion_worker_count'), # Calibration runs at same rate as ingestion
         'ANALYSIS': config_manager.get_param('analysis_worker_count'),
+        'FUZZ_GENERATOR': config_manager.get_param('fuzz_generator_worker_count'),
         'IMPLEMENTATION': config_manager.get_param('implementation_worker_count'),
         'VJS': config_manager.get_param('vjs_worker_count'),
+        'CF_SUBMISSION': config_manager.get_param('cf_submission_worker_count'),
         'DATA_ASSEMBLY': config_manager.get_param('data_assembly_worker_count')
     }
 
@@ -131,6 +136,34 @@ def main(args: argparse.Namespace) -> None:
     )
     health_monitor_thread.start()
 
+    # BUGFIX: Initialize Optimizer thread
+    optimizer = PipelineOptimizer(
+        gemini_km=gemini_key_manager,
+        groq_km=groq_key_manager,
+        # No account manager passed here as scraper polling is localized to ingestion_node
+    )
+    
+    def optimizer_loop():
+        from config import OPTIMIZER_LOOP_DELAY_SECONDS
+        while not stop_event.is_set():
+            try:
+                optimizer.optimize()
+            except Exception as e:
+                logging.error(f"Optimizer loop caught an error: {e}")
+            
+            # Sleep in small increments to allow quick shutdown
+            for _ in range(OPTIMIZER_LOOP_DELAY_SECONDS):
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
+
+    optimizer_thread = threading.Thread(
+        target=optimizer_loop,
+        name="OptimizerLoop",
+        daemon=True
+    )
+    optimizer_thread.start()
+
     # BUGFIX: Initialize pool and count tracking dictionaries
     # These will now be managed inside the loop to allow for dynamic resizing
     active_pools = {}
@@ -139,8 +172,10 @@ def main(args: argparse.Namespace) -> None:
     # Stage definitions — ingestion/calibration excluded on DGX
     stage_definitions = {
         'ANALYSIS': (analysis_worker, ('gemini_key_manager',)),
+        'FUZZ_GENERATOR': (fuzz_generator_worker, ('gemini_key_manager',)),
         'IMPLEMENTATION': (implementation_worker, ('groq_key_manager',)),
         'VJS': (vjs_worker, ()),
+        'CF_SUBMISSION': (cf_submission_worker, ()),
         'DATA_ASSEMBLY': (data_assembly_worker, ()),
     }
     if not DISABLE_INGESTION:
@@ -178,7 +213,8 @@ def main(args: argparse.Namespace) -> None:
             }
 
             current_analysis_batch_size = config_manager.get_param('analysis_batch_size')
-            logging.info(f"Cycle Start. Live Config: analysis_batch_size={current_analysis_batch_size}, workers={worker_counts}")
+            current_fuzz_batch_size = config_manager.get_param('fuzz_batch_size')
+            logging.info(f"Cycle Start. Live Config: analysis_batch_size={current_analysis_batch_size}, fuzz_batch={current_fuzz_batch_size}, workers={worker_counts}")
             
             active_jobs = 0
             for stage_name, pool in active_pools.items():
@@ -190,6 +226,8 @@ def main(args: argparse.Namespace) -> None:
                 batch_size = 1
                 if stage_name == 'ANALYSIS':
                     batch_size = current_analysis_batch_size
+                elif stage_name == 'FUZZ_GENERATOR':
+                    batch_size = current_fuzz_batch_size
 
                 # Fetch enough jobs to keep all workers in the pool busy
                 jobs_to_fetch = batch_size * pool._max_workers
@@ -237,6 +275,7 @@ def main(args: argparse.Namespace) -> None:
                     pass
         
         health_monitor_thread.join(timeout=5)
+        optimizer_thread.join(timeout=5)
         db_writer.stop()
         logging.info("All systems nominal. Project Synapse signing off.")
 
