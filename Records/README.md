@@ -17,15 +17,21 @@ A golden record is the verified, enriched output for a single competitive progra
 
 ## Sample Files & Showcase
 
-📖 **Pretty-Printed Showcase**: Read [`sample.md`](./sample.md) for a human-readable walkthrough of the 809B Golden Record.
+📖 **Pretty-Printed Showcases**:
+- [**809B Showcase (Interactive Binary Search)**](./sample.md)
+- [**809D Showcase (Treap DP)**](./sample_809D.md)
+- [**1001H Showcase (Segment Tree Offline Queries)**](./sample_1001H.md)
 
-| File | Description / Problem | Type |
-|------|-----------------------|------|
-| [sample.md](./sample.md) | **Human-Readable Pretty Print Showcase (809B)** | Markdown Showcase |
-| [809B_golden_record.json](./809B_golden_record.json) | 809B - Glad to see you! (~1400 rating) | Raw JSON Record |
-| [809D_golden_record.json](./809D_golden_record.json) | 809D - Masha and a Beautiful Tree (~1600 rating) | Raw JSON Record |
-| [1001H_golden_record.json](./1001H_golden_record.json) | 1001H - Closest Equals (~2700 rating) | Raw JSON Record |
-| [all_golden_records.md](./all_golden_records.md) | All processed records summary | Summary Document |
+| File | Description / Problem | Type | Rating |
+|------|-----------------------|------|--------|
+| [sample.md](./sample.md) | **Human-Readable Showcase: 809B - Glad to see you!** | Markdown Showcase | ~1400 |
+| [sample_809D.md](./sample_809D.md) | **Human-Readable Showcase: 809D - Hitchhiking in the Baltic States** | Markdown Showcase | ~2600 |
+| [sample_1001H.md](./sample_1001H.md) | **Human-Readable Showcase: 1001H - Closest Equals** | Markdown Showcase | ~2700 |
+| [809B_golden_record.json](./809B_golden_record.json) | 809B - Glad to see you! | Raw JSON Record | ~1400 |
+| [809D_golden_record.json](./809D_golden_record.json) | 809D - Hitchhiking in the Baltic States | Raw JSON Record | ~2600 |
+| [1001H_golden_record.json](./1001H_golden_record.json) | 1001H - Closest Equals | Raw JSON Record | ~2700 |
+| [all_golden_records.md](./all_golden_records.md) | All processed records summary | Summary Document | — |
+
 
 
 > **Note:** The live dataset (`dataset.jsonl`) is tracked via DVC and not stored in Git. Use `dvc pull` to retrieve it.
