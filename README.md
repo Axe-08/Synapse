@@ -14,10 +14,13 @@ Synapse solves a hard data problem: **generating a verified, high-quality datase
 
 The pipeline is designed for **unattended, long-running operation** — you start it, and it runs until it's done (or you stop it). A built-in `optimizer` module monitors health metrics and dynamically tunes worker counts and batch sizes using AIMD control loops.
 
-### Sample Output (Golden Record Showcase)
+### Sample Output (Golden Record Showcases)
 
-→ 📖 **Pretty-printed Showcase**: See [`Records/sample.md`](./Records/sample.md) for a human-readable walkthrough of a Golden Record output.  
-→ 📄 **Raw JSON Dataset Entry**: See [`Records/809B_golden_record.json`](./Records/809B_golden_record.json).
+📖 **Pretty-printed Markdown Showcases**:
+- [**Problem 809B Showcase** (*Glad to see you!* — Interactive Binary Search)](./Records/sample.md)
+- [**Problem 809D Showcase** (*Hitchhiking in the Baltic States* — Treap DP)](./Records/sample_809D.md)
+- [**Problem 1001H Showcase** (*Closest Equals* — Segment Tree Offline Queries)](./Records/sample_1001H.md)
+
 
 
 ---
