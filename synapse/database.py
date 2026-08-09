@@ -197,7 +197,7 @@ def get_next_jobs(status: str, limit: int) -> List[Dict[str, Any]]:
                     cur = conn.cursor()
                     # Use FOR UPDATE SKIP LOCKED for PostgreSQL — eliminates waits
                     cur.execute(
-                        "SELECT id, rating FROM problems "
+                        "SELECT id, rating, problem_class FROM problems "
                         "WHERE status = %s "
                         "ORDER BY priority DESC, rating ASC "
                         "LIMIT %s FOR UPDATE SKIP LOCKED",
@@ -207,7 +207,7 @@ def get_next_jobs(status: str, limit: int) -> List[Dict[str, Any]]:
                     if not rows:
                         return []
                     problem_ids = [r[0] for r in rows]
-                    jobs = [{'id': r[0], 'rating': r[1]} for r in rows]
+                    jobs = [{'id': r[0], 'rating': r[1], 'problem_class': r[2]} for r in rows]
                     cur.execute(
                         "UPDATE problems SET status = %s, last_updated = %s "
                         "WHERE id = ANY(%s)",
@@ -219,7 +219,7 @@ def get_next_jobs(status: str, limit: int) -> List[Dict[str, Any]]:
                     cursor = conn.cursor()
                     cursor.execute("BEGIN;")
                     cursor.execute(
-                        "SELECT id, rating FROM problems "
+                        "SELECT id, rating, problem_class FROM problems "
                         "WHERE status = ? "
                         "ORDER BY priority DESC, rating ASC LIMIT ?",
                         (status, limit)
@@ -229,7 +229,7 @@ def get_next_jobs(status: str, limit: int) -> List[Dict[str, Any]]:
                         conn.commit()
                         return []
                     problem_ids = [r[0] for r in rows]
-                    jobs = [{'id': r[0], 'rating': r[1]} for r in rows]
+                    jobs = [{'id': r[0], 'rating': r[1], 'problem_class': r[2]} for r in rows]
                     placeholders = ','.join('?' for _ in problem_ids)
                     cursor.execute(
                         f"UPDATE problems SET status = ?, last_updated = ? WHERE id IN ({placeholders})",
@@ -266,17 +266,30 @@ def transition_to_pending_calibration(problem_id: str) -> None:
                          'Multi-oracle data ingested. Ready for calibration.')
 
 
+def transition_batch_to_pending_fuzz_generation(problem_ids: List[str]) -> None:
+    for pid in problem_ids:
+        _update_problem_status(pid, 'pending_fuzz_generation', {'analysis_try_count': 1})
+        save_process_history(pid, 'ANALYSIS', 'SUCCESS',
+                             'Pseudocode generated. Ready for fuzz generation.')
+
+
 def transition_batch_to_pending_implementation(problem_ids: List[str]) -> None:
     for pid in problem_ids:
-        _update_problem_status(pid, 'pending_implementation', {'analysis_try_count': 1})
-        save_process_history(pid, 'ANALYSIS', 'SUCCESS',
-                             'Pseudocode generated. Ready for implementation.')
+        _update_problem_status(pid, 'pending_implementation')
+        save_process_history(pid, 'FUZZ_GENERATION', 'SUCCESS',
+                             'Fuzz generator created. Ready for implementation.')
 
 
 def transition_to_pending_vjs(problem_id: str) -> None:
     _update_problem_status(problem_id, 'pending_vjs', {'implementation_try_count': 1})
     save_process_history(problem_id, 'IMPLEMENTATION', 'SUCCESS',
                          'Code generated. Ready for VJS.')
+
+
+def transition_to_pending_cf_submission(problem_id: str) -> None:
+    _update_problem_status(problem_id, 'pending_cf_submission', {'implementation_try_count': 1})
+    save_process_history(problem_id, 'IMPLEMENTATION', 'SUCCESS',
+                         'Code generated. Routing to CF Submission (non-standard problem).')
 
 
 def transition_to_pending_implementation_retry(problem_id: str, report: str) -> None:
@@ -292,6 +305,13 @@ def transition_to_pending_analysis_retry(problem_id: str, report: str) -> None:
                             'priority': 1})
     save_process_history(problem_id, 'VJS', 'RETRY_LOOP',
                          f'Logic/Test error. Retrying. Report: {report[:500]}')
+
+
+def transition_to_pending_fuzz_generation_retry(problem_id: str, report: str) -> None:
+    _update_problem_status(problem_id, 'pending_fuzz_generation',
+                           {'last_vjs_report': report, 'priority': 1})
+    save_process_history(problem_id, 'VJS', 'RETRY_LOOP',
+                         f'Fuzzer logic bad (No oracle consensus). Retrying. Report: {report[:500]}')
 
 
 def transition_to_pending_data_assembly(problem_id: str) -> None:
@@ -349,8 +369,8 @@ def save_calibration_results(
     _async_execute(sql, (successful_oracles, problem_id))
 
 
-def save_ingested_data(problem_id: str, data: Dict[str, Any]) -> None:
-    """(Sync) Saves all scraped data to the workspace cache."""
+def save_ingested_data(problem_id: str, data: Dict[str, Any], problem_class: str = 'standard') -> None:
+    """(Sync) Saves all scraped data to the workspace cache and problem_class to progress."""
     ph = '%s' if USE_POSTGRES else '?'
     sql = f"""INSERT INTO problem_data_cache
                (problem_id, problem_statement_html, reference_solution_json,
@@ -389,6 +409,12 @@ def save_ingested_data(problem_id: str, data: Dict[str, Any]) -> None:
                 ),
                 params
             )
+    # Also store problem_class in the progress table
+    if problem_class != 'standard':
+        _async_execute(
+            _adapt_sql("UPDATE problems SET problem_class = ? WHERE id = ?"),
+            (problem_class, problem_id)
+        )
 
 
 def save_analysis_results(
@@ -482,7 +508,53 @@ def update_workspace_with_analysis_results(
     save_analysis_results(problem_id, pseudocode, analysis_json)
 
 
+def update_workspace_with_fuzzer(problem_id: str, fuzzer_py: str) -> None:
+    """(Sync) Saves fuzz generator script to workspace."""
+    ph = '%s' if USE_POSTGRES else '?'
+    if USE_POSTGRES:
+        with _get_db_connection(WORKSPACE_DB_PATH) as conn:
+            conn.cursor().execute(
+                f"UPDATE problem_data_cache SET input_generator_py = {ph} WHERE problem_id = {ph}",
+                (fuzzer_py, problem_id)
+            )
+    else:
+        with _get_db_connection(WORKSPACE_DB_PATH) as conn:
+            conn.execute(
+                "UPDATE problem_data_cache SET input_generator_py = ? WHERE problem_id = ?",
+                (fuzzer_py, problem_id)
+            )
+
 def update_workspace_with_implementation_results(
     problem_id: str, code: str
 ) -> None:
     save_implementation_result(problem_id, code)
+
+
+def save_multi_oracle_ingestion_data(
+    problem_id: str, html: str, pretests: list,
+    successful_solutions: list, time_limit_raw: str,
+    memory_limit_raw: str, problem_class: str = 'standard',
+) -> None:
+    """Backward-compat alias used by ingestion worker."""
+    import json
+    
+    codes = []
+    primary_submission = {}
+    for i, sol in enumerate(successful_solutions):
+        if isinstance(sol, dict):
+            if i == 0:
+                primary_submission = sol.get('submission_object', {})
+            codes.append(sol.get('source_code', ''))
+        else:
+            codes.append(sol)
+            
+    data = {
+        'problem_statement_html': html,
+        'pretests_json': json.dumps(pretests) if isinstance(pretests, list) else pretests,
+        'reference_solution_code': codes[0] if codes else None,
+        'secondary_reference_codes_json': json.dumps(codes[1:]) if len(codes) > 1 else '[]',
+        'reference_solution_json': json.dumps({'submission_object': primary_submission}),
+        'time_limit_raw': time_limit_raw,
+        'memory_limit_raw': memory_limit_raw,
+    }
+    save_ingested_data(problem_id, data, problem_class=problem_class)

@@ -29,6 +29,13 @@ def calibration_worker(problem: Dict[str, Any], worker_id: str):
         if not workspace_data:
             raise Exception("Workspace data not found for calibration.")
 
+        p_class = problem.get('problem_class', 'standard')
+        if p_class != 'standard':
+            logging.info(f"[{problem_id}] Non-standard problem class '{p_class}'. Bypassing calibration.")
+            db.save_calibration_results(problem_id, 5, [], [], 1.0, 'strict')
+            db.transition_to_pending_analysis(problem_id)
+            return
+
         primary_code = workspace_data.get('reference_solution_code')
         secondary_codes = json.loads(workspace_data.get('secondary_reference_codes_json', '[]'))
         all_oracle_codes = [primary_code] + secondary_codes
@@ -47,7 +54,7 @@ def calibration_worker(problem: Dict[str, Any], worker_id: str):
                 compiled_oracle_paths.append(result['executable_path'])
                 temp_dirs_to_clean.append(os.path.dirname(result['executable_path']))
             else:
-                logging.warning(f"[{problem_id}] Oracle {i} failed to compile.")
+                logging.warning(f"[{problem_id}] Oracle {i} failed to compile: {result.get('report')}")
 
         # 3. Check quorum of viable oracles
         successful_oracles_count = len(compiled_oracle_paths)

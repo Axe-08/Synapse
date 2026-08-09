@@ -10,7 +10,7 @@ from ._shared import (
     logging, json, time, os, Queue, Dict, Any,
     db, MAX_BROWSER_USES,
 )
-from synapse.scraper import get_authenticated_driver, fetch_problem_data, IPBanException
+from synapse.scraper import get_authenticated_driver, fetch_problem_data, IPBanException, classify_problem
 
 
 def ingestion_worker(problem: Dict[str, Any], worker_id: str, browser_queue: Queue):
@@ -55,14 +55,15 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: str, browser_queue: Que
         scraped_data = fetch_problem_data(problem_id, driver, exclude_submission_ids=exclude_ids)
 
         html_statement = scraped_data['page_details']['problem_statement_html']
-        if (
-            "interaction protocol" in html_statement.lower()
-            or "note that the program" in html_statement.lower()
-        ):
-            reason = "Skipping interactive problem."
-            logging.warning(f"QUARANTINING {problem_id}: {reason}")
-            db.transition_to_quarantined(problem_id, reason)
-            return
+
+        # Classify the problem instead of quarantining interactive ones
+        problem_class = classify_problem(
+            problem_type=scraped_data.get('problem_type', ''),
+            tags=scraped_data.get('tags', []),
+            statement_html=html_statement,
+        )
+        if problem_class != 'standard':
+            logging.info(f"Classified {problem_id} as '{problem_class}'")
 
         if not scraped_data:
             reason = "Failed to find a new valid reference solution."
@@ -78,6 +79,7 @@ def ingestion_worker(problem: Dict[str, Any], worker_id: str, browser_queue: Que
             successful_solutions=scraped_data['successful_solutions'],
             time_limit_raw=scraped_data['page_details']['time_limit_raw'],
             memory_limit_raw=scraped_data['page_details']['memory_limit_raw'],
+            problem_class=problem_class,
         )
         if is_rescraping:
             db.reset_retry_counts(problem_id)

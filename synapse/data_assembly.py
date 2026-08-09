@@ -46,7 +46,10 @@ def _assemble_golden_record(problem_id: str, workspace_data: Dict[str, Any]) -> 
     Returns:
         A dictionary representing the final, structured data record.
     """
-    ref_submission = json.loads(workspace_data['reference_solution_json'])
+    # Unwrap the reference submission object from our Scraper structure
+    raw_ref = json.loads(workspace_data['reference_solution_json'])
+    ref_submission = raw_ref.get('submission_object', raw_ref)
+    
     html_statement = workspace_data['problem_statement_html']
     pretests = json.loads(workspace_data['pretests_json'])
     
@@ -81,8 +84,16 @@ def _assemble_golden_record(problem_id: str, workspace_data: Dict[str, Any]) -> 
             "code": workspace_data.get('reference_solution_code')
         },
         "verified_pseudocode": workspace_data.get('arl_pseudocode'),
-        "verified_solution_code": workspace_data.get('arl_reconstructed_code')
+        "verified_solution_code": workspace_data.get('arl_reconstructed_code'),
+        "fuzzer_script": workspace_data.get('input_generator_py')
     }
+    
+    fuzz_tests_json = workspace_data.get('generated_tests_json')
+    if fuzz_tests_json:
+        try:
+            final_record['fuzz_test_cases'] = json.loads(fuzz_tests_json)
+        except json.JSONDecodeError:
+            logging.warning(f"Could not parse generated_tests_json for {problem_id}")
     
     # Add the code quality analysis if it exists
     analysis_json = workspace_data.get('quality_analysis_json')

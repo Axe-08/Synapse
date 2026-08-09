@@ -200,3 +200,159 @@ def run_semantic_analysis(code: str) -> Dict[str, Any]:
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+# ── Fuzz Test Generator Pipeline ─────────────────────────────────────────
+
+import hashlib
+
+
+def run_fuzz_generator(generator_py: str, count: int = 20, timeout_per_run: int = 5) -> List[str]:
+    """
+    Execute a Python generator script `count` times, capturing stdout each time.
+
+    The generator script should print a valid random test input to stdout.
+
+    Args:
+        generator_py: Python source code that generates a random test input.
+        count: Number of times to run the generator.
+        timeout_per_run: Max seconds per execution.
+
+    Returns:
+        List of generated input strings (only successful runs).
+    """
+    inputs = []
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        gen_path = f.name
+        f.write(generator_py)
+
+    try:
+        for i in range(count):
+            try:
+                result = subprocess.run(
+                    ['python3', gen_path],
+                    capture_output=True, text=True,
+                    timeout=timeout_per_run,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    inputs.append(result.stdout.strip())
+                else:
+                    logging.debug(
+                        f"Fuzz generator run {i+1}/{count} failed: "
+                        f"exit={result.returncode} stderr={result.stderr[:200]}"
+                    )
+            except subprocess.TimeoutExpired:
+                logging.debug(f"Fuzz generator run {i+1}/{count} timed out.")
+            except Exception as e:
+                logging.debug(f"Fuzz generator run {i+1}/{count} error: {e}")
+    finally:
+        if os.path.exists(gen_path):
+            os.remove(gen_path)
+
+    logging.info(f"Fuzz generator produced {len(inputs)}/{count} valid inputs.")
+    return inputs
+
+
+def validate_generated_inputs(
+    inputs: List[str],
+    oracle_paths: List[str],
+    time_limit_ms: int = 5000,
+    memory_limit_kb: int = 262144,
+) -> List[Dict[str, str]]:
+    """
+    For each generated input, run ALL compiled oracles.
+    Keep only inputs where all oracles agree on the output.
+
+    Args:
+        inputs: List of test input strings from fuzz generator.
+        oracle_paths: List of absolute paths to compiled oracle executables.
+        time_limit_ms: Time limit per oracle run in milliseconds.
+        memory_limit_kb: Memory limit per oracle run.
+
+    Returns:
+        List of {'input': ..., 'output': ...} dicts for validated cases.
+    """
+    if not oracle_paths or not inputs:
+        return []
+
+    validated = []
+    timeout_sec = (time_limit_ms / 1000.0) + 2.0
+    user_id = f"{os.getuid()}:{os.getgid()}"
+
+    for test_input in inputs:
+        outputs = []
+        all_agree = True
+
+        for oracle_path in oracle_paths:
+            oracle_dir = os.path.dirname(oracle_path)
+            oracle_name = os.path.basename(oracle_path)
+            try:
+                run_cmd = [
+                    "docker", "run", "--rm", "-u", user_id, "-i",
+                    "--memory", f"{memory_limit_kb}k",
+                    "-v", f"{oracle_dir}:/app:ro",
+                    "-w", "/app",
+                    "synapse-judge",
+                    "timeout", str(timeout_sec),
+                    f"./{oracle_name}",
+                ]
+                proc = subprocess.run(
+                    run_cmd,
+                    input=test_input, capture_output=True, text=True,
+                    timeout=timeout_sec + 5,
+                )
+                if proc.returncode != 0:
+                    all_agree = False
+                    break
+                outputs.append(proc.stdout.strip())
+            except (subprocess.TimeoutExpired, Exception):
+                all_agree = False
+                break
+
+        if all_agree and outputs and len(set(outputs)) == 1:
+            validated.append({'input': test_input, 'output': outputs[0]})
+
+    logging.info(
+        f"Fuzz validation: {len(validated)}/{len(inputs)} inputs passed oracle consensus."
+    )
+    return validated
+
+
+def build_combined_test_suite(
+    validated_pretests: List[Dict[str, str]],
+    validated_generated: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """
+    Merge pretests and generated tests into a single suite.
+    Deduplicates by input hash.
+
+    Args:
+        validated_pretests: List of {'input': ..., 'output': ...} from scraping.
+        validated_generated: List of {'input': ..., 'output': ...} from fuzz gen.
+
+    Returns:
+        Combined, deduplicated test suite.
+    """
+    seen_hashes = set()
+    combined = []
+
+    # Pretests first (they take priority)
+    for test in validated_pretests:
+        h = hashlib.md5(test['input'].encode()).hexdigest()
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            combined.append(test)
+
+    # Then generated tests
+    for test in validated_generated:
+        h = hashlib.md5(test['input'].encode()).hexdigest()
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            combined.append(test)
+
+    logging.info(
+        f"Combined test suite: {len(combined)} tests "
+        f"({len(validated_pretests)} pretests + "
+        f"{len(combined) - len(validated_pretests)} generated)"
+    )
+    return combined

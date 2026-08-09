@@ -45,17 +45,90 @@ class IPBanException(Exception):
     """Custom exception for IP bans."""
     pass
 
+
+# ── Problem Classification ──────────────────────────────────────────────────
+
+# Patterns that indicate a special-judge problem
+_SPECIAL_JUDGE_PATTERNS = [
+    "you may print any",
+    "you may output any",
+    "any valid answer",
+    "if there are multiple",
+    "if there are several",
+    "print any of them",
+    "output any of them",
+]
+
+# Patterns that indicate a constructive/output-only problem
+_CONSTRUCTIVE_PATTERNS = [
+    "construct a",
+    "construct an",
+    "find any",
+    "output any valid",
+    "print any valid",
+]
+
+
+def classify_problem(
+    problem_type: str = "",
+    tags: list = None,
+    statement_html: str = "",
+) -> str:
+    """
+    Classify a Codeforces problem into one of:
+      - 'interactive'    — requires live interaction with judge
+      - 'special_judge'  — multiple valid outputs, checker needed
+      - 'constructive'   — any valid construction accepted
+      - 'standard'       — exact-match output
+
+    Classification priority: interactive > special_judge > constructive > standard.
+
+    Args:
+        problem_type:  CF API 'type' field (e.g. 'PROGRAMMING', 'INTERACTIVE')
+        tags:          CF API tags list (e.g. ['dp', 'special judge'])
+        statement_html: Raw HTML of the problem statement
+
+    Returns:
+        One of 'interactive', 'special_judge', 'constructive', 'standard'.
+    """
+    tags = tags or []
+    statement_lower = statement_html.lower()
+    tags_lower = [t.lower() for t in tags]
+
+    # 1. Interactive (highest priority)
+    if problem_type.upper() == "INTERACTIVE":
+        return "interactive"
+    if "interaction protocol" in statement_lower or "interactor" in statement_lower or "interaction" in statement_lower or "fflush(stdout)" in statement_lower:
+        return "interactive"
+    if "interactive" in tags_lower:
+        return "interactive"
+
+    # 2. Special judge
+    if "special judge" in tags_lower or "special" in tags_lower:
+        return "special_judge"
+    for pattern in _SPECIAL_JUDGE_PATTERNS:
+        if pattern in statement_lower:
+            return "special_judge"
+
+    # 3. Constructive
+    if "constructive algorithms" in tags_lower:
+        return "constructive"
+    for pattern in _CONSTRUCTIVE_PATTERNS:
+        if pattern in statement_lower:
+            return "constructive"
+
+    # 4. Default
+    return "standard"
+
 # Suppress noisy logs from Selenium
 logging.getLogger('selenium.webdriver.remote.remote_connection').setLevel(logging.WARNING)
 logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
 load_dotenv()
 
 session = requests.Session()
-CF_HANDLE = os.getenv('CF_HANDLE')
-CF_PASSWORD = os.getenv('CF_PASSWORD')
 MY_USER_AGENT = os.getenv('MY_USER_AGENT')
-if not all([CF_HANDLE, CF_PASSWORD, MY_USER_AGENT]):
-    raise ValueError("Please set CF_HANDLE, CF_PASSWORD, and MY_USER_AGENT in your .env file.")
+if not MY_USER_AGENT:
+    raise ValueError("Please set MY_USER_AGENT in your .env file.")
 session.headers.update({'User-Agent': MY_USER_AGENT})
 
 API_BASE = "https://codeforces.com/api"
@@ -82,14 +155,15 @@ def _parse_pre_tag(pre_tag):
     # Normalize Windows-style newlines to Linux-style
     return text.replace('\r\n', '\n').strip()
 
-def fetch_problem_page_details(contest_id: int, problem_index: str) -> dict:
+def fetch_problem_page_details(contest_id: int, problem_index: str, driver: Optional[uc.Chrome] = None) -> dict:
     """
     Scrapes the public problem page for statement, metadata, and example pretests.
-    This does NOT require a logged-in session.
+    If an authenticated driver is provided, it uses it to bypass Cloudflare.
 
     Args:
         contest_id: The contest ID of the problem.
         problem_index: The index of the problem (e.g., 'A', 'B1').
+        driver: Optional authenticated Selenium driver.
 
     Returns:
         A dictionary containing the problem statement HTML, raw limits, and
@@ -101,17 +175,28 @@ def fetch_problem_page_details(contest_id: int, problem_index: str) -> dict:
     url = PROBLEM_URL_TEMPLATE.format(contestId=contest_id, index=problem_index)
     logging.info(f"Scraping problem page: {url}")
     try:
-        response = requests.get(url, headers={'User-Agent': MY_USER_AGENT}, timeout=DEFAULT_SCRAPER_REQUEST_TIMEOUT)
-        response.raise_for_status()
-        if "blocked by administrator" in response.text.lower() or "you have been blocked" in response.text.lower():
-            logging.critical(f"IP BAN DETECTED from URL: {url}")
-            db.log_metric('INGESTION', 'scrape_blocked', 0, False, {'url': url})
-            raise IPBanException("Scraper was blocked by administrator.")
+        if driver:
+            driver.get(url)
+            html_content = driver.page_source
+            if "blocked by administrator" in html_content.lower() or "you have been blocked" in html_content.lower():
+                logging.critical(f"IP BAN DETECTED from URL: {url}")
+                db.log_metric('INGESTION', 'scrape_blocked', 0, False, {'url': url})
+                raise IPBanException("Scraper was blocked by administrator.")
+        else:
+            response = requests.get(url, headers={'User-Agent': MY_USER_AGENT}, timeout=DEFAULT_SCRAPER_REQUEST_TIMEOUT)
+            response.raise_for_status()
+            html_content = response.content
+            if "blocked by administrator" in response.text.lower() or "you have been blocked" in response.text.lower():
+                logging.critical(f"IP BAN DETECTED from URL: {url}")
+                db.log_metric('INGESTION', 'scrape_blocked', 0, False, {'url': url})
+                raise IPBanException("Scraper was blocked by administrator.")
 
-        soup = BeautifulSoup(response.content, 'html.parser')
+        soup = BeautifulSoup(html_content, 'html.parser')
 
         problem_statement_div = soup.find('div', class_='problem-statement')
         if not problem_statement_div:
+            if driver:
+                driver.save_screenshot("debug_problem_statement_missing.png")
             raise Exception("Problem statement div not found.")
 
         time_limit_text = problem_statement_div.find('div', class_='time-limit').text.replace('time limit per test', '').strip()
@@ -140,7 +225,7 @@ def fetch_problem_page_details(contest_id: int, problem_index: str) -> dict:
         return {}
 
 
-def get_authenticated_driver() -> Optional[uc.Chrome]:
+def get_authenticated_driver(account_manager: Optional[Any] = None) -> Optional[uc.Chrome]:
     """
     Launches a new undetected_chromedriver instance and handles the login
     process for Codeforces, maintaining a persistent session.
@@ -161,7 +246,7 @@ def get_authenticated_driver() -> Optional[uc.Chrome]:
     try:
         options = uc.ChromeOptions()
         options.add_argument('--window-size=1920,1080')
-        driver = uc.Chrome(options=options, browser_executable_path=browser_executable_path, user_data_dir="./chrome_profile")
+        driver = uc.Chrome(options=options, browser_executable_path=browser_executable_path, user_data_dir="./chrome_profile", version_main=145)
         driver.get("https://codeforces.com/problemset")
         try:
             long_wait = WebDriverWait(driver, DEFAULT_SELENIUM_LONG_WAIT)
@@ -188,14 +273,28 @@ def get_authenticated_driver() -> Optional[uc.Chrome]:
                 input(">>> After LOGIN FORM is visible, press Enter...")
                 handle_input = WebDriverWait(driver, 60).until(EC.presence_of_element_located((By.ID, "handleOrEmail")))
 
+            
+            if account_manager:
+                acct = account_manager.get_active_account()
+                if not acct:
+                    logging.critical("No active accounts available.")
+                    return None
+                handle = acct.handle
+                password = acct.password
+            else:
+                handle = os.getenv('CF_HANDLE')
+                password = os.getenv('CF_PASSWORD')
+                if not handle or not password:
+                    raise ValueError("CF_HANDLE and CF_PASSWORD must be provided if no account_manager is passed.")
+
             password_input = driver.find_element(By.ID, "password")
-            handle_input.send_keys(CF_HANDLE)
-            password_input.send_keys(CF_PASSWORD)
+            handle_input.send_keys(handle)
+            password_input.send_keys(password)
             remember_checkbox = driver.find_element(By.ID, "remember")
             if not remember_checkbox.is_selected():
                 remember_checkbox.click()
             driver.find_element(By.CLASS_NAME, "submit").click()
-            WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.LINK_TEXT, CF_HANDLE)))
+            WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.LINK_TEXT, handle)))
             logging.info("SUCCESS: Login to Codeforces confirmed.")
             return driver
 
@@ -309,8 +408,8 @@ def fetch_problem_data(problem_id: str, driver: uc.Chrome, exclude_submission_id
         return None
     contest_id, problem_index = int(match.group(1)), match.group(2)
 
-    # Step 1: Fast, public scrape with `requests`
-    page_details = fetch_problem_page_details(contest_id, problem_index)
+    # Step 1: Scrape with authenticated driver to safely bypass Cloudflare
+    page_details = fetch_problem_page_details(contest_id, problem_index, driver=driver)
     if not page_details:
         return None
 

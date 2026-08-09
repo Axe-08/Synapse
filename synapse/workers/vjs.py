@@ -13,6 +13,15 @@ from ._shared import (
 )
 from synapse.data_assembly import _parse_time_limit, _parse_memory_limit
 
+def __save_generated_tests(problem_id: str, test_arr: list):
+    ph = '%s' if db.USE_POSTGRES else '?'
+    sql = f"UPDATE problem_data_cache SET generated_tests_json = {ph} WHERE problem_id = {ph}"
+    if db.USE_POSTGRES:
+        with db._get_db_connection(db.WORKSPACE_DB_PATH) as conn:
+            conn.cursor().execute(sql, (json.dumps(test_arr), problem_id))
+    else:
+        with db._get_db_connection(db.WORKSPACE_DB_PATH) as conn:
+            conn.execute(sql, (json.dumps(test_arr), problem_id))
 
 def vjs_worker(problem: Dict[str, Any], worker_id: str):
     """
@@ -191,12 +200,137 @@ def vjs_worker(problem: Dict[str, Any], worker_id: str):
             db.transition_to_pending_analysis_retry(problem_id, report)
             return
 
-        # SUCCESS
-        db.update_problem_status(problem_id, None, extra_updates={'confidence_level': 2})
+            return
+
+        # =====================================================================
+        # --- STAGE 4: Fuzz Testing ---
+        # =====================================================================
+        input_generator_py = workspace_data.get('input_generator_py')
+    
+        if not input_generator_py:
+            # No fuzzer available, bypass fuzzing sequence entirely!
+            logging.info(f"[{problem_id}] No Python fuzzer attached. Skipping STAGE 4 Fuzzing.")
+            db._update_problem_status(problem_id, None, extra_updates={'confidence_level': 2})
+            db.transition_to_pending_data_assembly(problem_id)
+            return
+
+        db.update_worker_status(worker_id, 'VJS', problem_id, 'FUZZ_TESTING', 'active')
+        logging.info(f"[{problem_id}] Pretests passed! Proceeding to STAGE 4 (Fuzz Testing)")
+
+        MAX_FUZZ_RETRIES = 3
+        fuzz_retries = 0
+        with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
+            query = "SELECT COUNT(*) FROM process_history WHERE problem_id=? AND event_type='RETRY_LOOP' AND details LIKE 'Fuzzer logic bad%'"
+            if db.USE_POSTGRES:
+                cur = conn.cursor()
+                cur.execute(query.replace('?', '%s'), (problem_id,))
+                fuzz_retries = cur.fetchone()[0]
+            else:
+                cur = conn.execute(query, (problem_id,))
+                fuzz_retries = cur.fetchone()[0]
+
+        fuzzer_script_path = os.path.join(vjs_temp_dir, "fuzzer.py")
+        with open(fuzzer_script_path, "w") as f:
+            f.write(input_generator_py)
+
+        N_FUZZ_TESTS = 10
+        fuzz_tests_list = []
+        for i in range(N_FUZZ_TESTS):
+            # Run Fuzzer natively
+            proc = subprocess.run(["python", fuzzer_script_path], capture_output=True, text=True, timeout=5.0)
+            if proc.returncode != 0:
+                if fuzz_retries >= MAX_FUZZ_RETRIES:
+                    logging.warning(f"[{problem_id}] MAX Fuzzer retries ({fuzz_retries}) exceeded. Skipping fuzzing.")
+                    break
+                report = f"Fuzz test generator script crashed!\nStderr:\n{proc.stderr}"
+                db.transition_to_pending_fuzz_generation_retry(problem_id, report)
+                return
+            
+            raw_input = proc.stdout.strip()
+            if not raw_input:
+                continue
+            
+            fuzz_in_path = os.path.join(vjs_temp_dir, f"fuzz_{i}.in")
+            with open(fuzz_in_path, "w") as f:
+                f.write(f"1\n{raw_input}")
+
+            # 1. Oracle Consensus on this fuzz test
+            fuzz_oracle_outputs = []
+            with ThreadPoolExecutor(max_workers=len(oracle_paths)) as executor:
+                def run_oracle_fuzz(exec_path):
+                    host_dir = os.path.dirname(exec_path)
+                    exec_name = os.path.basename(exec_path)
+                    run_cmd = [
+                        "docker", "run", "--rm", "-u", user_id, "-i",
+                        "--ulimit", "stack=268435456",
+                        f"--memory={memory_limit_kb}k",
+                        "-v", f"{host_dir}:/app:ro", "-w", "/app",
+                        "synapse-judge", "timeout", "5.0", f"./{exec_name}",
+                    ]
+                    with open(fuzz_in_path, 'r') as stdin_f:
+                        opro = subprocess.run(run_cmd, stdin=stdin_f, capture_output=True, text=True, timeout=10.0)
+                    if opro.returncode != 0: return "RUNTIME_ERROR"
+                    return opro.stdout.strip().replace('\r\n', '\n')
+
+                futures = {executor.submit(run_oracle_fuzz, path): path for path in oracle_paths}
+                for f_fut in as_completed(futures):
+                    fuzz_oracle_outputs.append(f_fut.result())
+
+            # Tier 1 Consensus
+            scores = {out: 0 for out in fuzz_oracle_outputs if "RUNTIME_ERROR" not in out}
+            for j, out in enumerate(fuzz_oracle_outputs):
+                if out in scores:
+                    rating = oracle_ratings.get(f"oracle_{j}", {}).get("rating", "Poor")
+                    scores[out] += rating_weights.get(rating, 1)
+
+            consensus_out = None
+            if scores:
+                best_out = max(scores, key=scores.get)
+                if scores[best_out] >= (MIN_VIABLE_ORACLES * rating_weights['Fair']):
+                    consensus_out = best_out
+            
+            if consensus_out is None:
+                if fuzz_retries >= MAX_FUZZ_RETRIES:
+                    logging.warning(f"[{problem_id}] MAX Fuzzer retries exceeded. Corrupt generation sequence. Skipping Fuzz testing.")
+                    break
+                report = f"Fuzz test #{i+1} caused Oracle Consensus Failure! The fuzzer generated invalid boundaries.\nInput generated:\n{raw_input[:500]}"
+                db.transition_to_pending_fuzz_generation_retry(problem_id, report)
+                return
+            
+            fuzz_out_path = os.path.join(vjs_temp_dir, f"fuzz_{i}.out")
+            with open(fuzz_out_path, "w") as f:
+                f.write(consensus_out)
+
+            # 2. Run AI Binary on fuzz test
+            ai_fuzz_out_path = os.path.join(vjs_temp_dir, f"ai_fuzz_{i}.out")
+            with open(fuzz_in_path, 'r') as stdin_f, open(ai_fuzz_out_path, 'w') as stdout_f:
+                run_proc = subprocess.run(docker_run_cmd, stdin=stdin_f, stdout=stdout_f, stderr=subprocess.PIPE, text=True, timeout=10.0)
+            
+            if run_proc.returncode != 0:
+                report = f"AI code execution crashed on FUZZ Test #{i+1}.\nGenerated Fuzz Input:\n{raw_input}\nStderr:\n{run_proc.stderr}"
+                db.transition_to_pending_analysis_retry(problem_id, report)
+                return
+
+            fuzz_checker_proc = subprocess.run(["python", "-m", "synapse.checker", fuzz_in_path, ai_fuzz_out_path, fuzz_out_path], capture_output=True, text=True)
+            if fuzz_checker_proc.returncode != 0:
+                report = f"WA/PE on FUZZ Test #{i+1}.\nGenerated Input:\n{raw_input}\nExpected output:\n{consensus_out}\nChecker Msg: {fuzz_checker_proc.stdout.strip()}"
+                db.transition_to_pending_analysis_retry(problem_id, report)
+                return
+
+            fuzz_tests_list.append({
+                "input": f"1\n{raw_input}",
+                "output": consensus_out
+            })
+
+        if fuzz_tests_list:
+            __save_generated_tests(problem_id, fuzz_tests_list)
+            db._update_problem_status(problem_id, None, extra_updates={'confidence_level': 3})
+            logging.info(f"SUCCESS [Final VJS] for {problem_id}. All Fuzz tests passed. -> pending_data_assembly")
+        else:
+            db._update_problem_status(problem_id, None, extra_updates={'confidence_level': 2})
+            logging.info(f"SUCCESS [Final VJS] for {problem_id}. -> pending_data_assembly")
+
         db.transition_to_pending_data_assembly(problem_id)
-        logging.info(
-            f"SUCCESS [Final VJS] for {problem_id}. All tests passed. -> pending_data_assembly"
-        )
 
     except Exception as e:
         logging.error(f"FAILED [Final VJS] for {problem_id}: {e}", exc_info=True)

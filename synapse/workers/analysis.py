@@ -101,7 +101,17 @@ def analysis_worker(batch: List[Dict[str, Any]], worker_id: str, gemini_km: KeyM
             logging.warning("API batch is empty after quality filtering.")
             return
 
-        parsed_json_output, _raw = call_gemini_analyst_batch(final_api_batch, gemini_km)
+        # Determine if simplification is needed for any problem in the batch
+        # Use simplify=True for the whole batch if ANY problem is on retry >= 1
+        # (Batch is usually size 1 for retries, so this is safe)
+        any_retry = any(
+            problem_states.get(p['id'], {}).get('analysis_tries', 0) >= 1
+            for p in problems_to_process
+        )
+
+        parsed_json_output, _raw = call_gemini_analyst_batch(
+            final_api_batch, gemini_km, simplify=any_retry
+        )
         pseudocode_results = parsed_json_output.get("final_pseudocode", {})
 
         successful_ids = []
@@ -113,12 +123,19 @@ def analysis_worker(batch: List[Dict[str, Any]], worker_id: str, gemini_km: KeyM
                 failed_ids.append(problem_id)
 
         if successful_ids:
-            logging.info(f"SUCCESS [Analysis] for problems: {successful_ids}. -> pending_implementation")
+            logging.info(f"SUCCESS [Analysis] for problems: {successful_ids}. -> pending_fuzz_generation")
             for problem_id in successful_ids:
                 pseudocode = pseudocode_results[problem_id]
                 analysis_details_json = json.dumps(parsed_json_output.get("analysis", {}))
                 db.update_workspace_with_analysis_results(problem_id, pseudocode, analysis_details_json)
-                db.transition_batch_to_pending_implementation([problem_id])
+                # If analysis_tries >= 2, the problem has now received simplified pseudocode
+                # AND still needs implementation — mark it so implementation.py know to use Gemini
+                a_tries = problem_states.get(problem_id, {}).get('analysis_tries', 0)
+                if a_tries >= 2:
+                    logging.info(f"[{problem_id}] analysis_tries={a_tries} >= 2: will escalate to Gemini implementation.")
+                    db.transition_batch_to_pending_fuzz_generation([problem_id])
+                else:
+                    db.transition_batch_to_pending_fuzz_generation([problem_id])
 
         if failed_ids:
             logging.warning(f"PARTIAL FAILURE [Analysis] for problems: {failed_ids}.")
