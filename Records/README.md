@@ -15,13 +15,17 @@ A golden record is the verified, enriched output for a single competitive progra
 - **Code quality metrics** — Cyclomatic Complexity, function count (via `lizard`)
 - **Provenance metadata** — timestamps, model versions, attempt counts
 
-## Sample Files
+## Sample Files & Showcase
 
-| File | Problem | Rating | Tags |
-|------|---------|--------|------|
-| [809B_golden_record.json](./809B_golden_record.json) | 809B - Leha and Lost Function | ~1400 | math, implementation |
-| [809D_golden_record.json](./809D_golden_record.json) | 809D - Masha and a Beautiful Tree | ~1600 | trees, dfs |
-| [1001H_golden_record.json](./1001H_golden_record.json) | 1001H - Closest Equals | ~2700 | segment tree, offline queries |
-| [all_golden_records.md](./all_golden_records.md) | All processed records | — | — |
+📖 **Pretty-Printed Showcase**: Read [`sample.md`](./sample.md) for a human-readable walkthrough of the 809B Golden Record.
+
+| File | Description / Problem | Type |
+|------|-----------------------|------|
+| [sample.md](./sample.md) | **Human-Readable Pretty Print Showcase (809B)** | Markdown Showcase |
+| [809B_golden_record.json](./809B_golden_record.json) | 809B - Glad to see you! (~1400 rating) | Raw JSON Record |
+| [809D_golden_record.json](./809D_golden_record.json) | 809D - Masha and a Beautiful Tree (~1600 rating) | Raw JSON Record |
+| [1001H_golden_record.json](./1001H_golden_record.json) | 1001H - Closest Equals (~2700 rating) | Raw JSON Record |
+| [all_golden_records.md](./all_golden_records.md) | All processed records summary | Summary Document |
+
 
 > **Note:** The live dataset (`dataset.jsonl`) is tracked via DVC and not stored in Git. Use `dvc pull` to retrieve it.
