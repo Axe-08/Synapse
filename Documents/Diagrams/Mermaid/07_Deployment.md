@@ -1,58 +1,51 @@
-# Deployment Diagram — Project Synapse
+# Deployment Diagram — Project Synapse v2.0
 
 ---
 
-## Deployment Architecture
-
-This diagram shows how all components of Project Synapse are deployed on the host machine, including software environments and external service connections.
+## Deployment Architecture (Hybrid)
 
 ```mermaid
 graph TB
     %% ============================
-    %% HOST MACHINE NODE
+    %% LAPTOP NODE
     %% ============================
-    subgraph HOST["🖥️ Host Machine (Linux)"]
+    subgraph LAPTOP["💻 Laptop (Linux)"]
 
-        subgraph PYTHON_ENV["Python 3.10+ Virtual Environment (venv/)"]
-            direction TB
-            
-            subgraph PROC_MAIN["Process 1: python main.py"]
-                P_ORCH["Orchestrator + Worker Threads\n─────────────────\n• Ingestion Workers (Selenium)\n• Calibration Workers\n• Analysis Workers (Gemini)\n• Implementation Workers (Groq)\n• VJS Workers (Docker subprocess)\n• Assembly Workers\n• KeyHealthMonitor Thread\n• DatabaseWriter Thread"]
-            end
-
-            subgraph PROC_OPT["Process 2: python synapse/optimizer.py"]
-                P_OPT["Optimizer Process\n─────────────────\n• AIMDController\n• P-Controller\n• SystemState checker\n• Runs every 60 seconds"]
-            end
-
-            subgraph PROC_DASH["Process 3: python status.py"]
-                P_DASH["Dashboard Process\n─────────────────\n• Rich Live terminal UI\n• Read-only DB polling\n• Refreshes every 2 seconds"]
-            end
+        subgraph LAPTOP_PYTHON["Python 3.10+ Virtual Environment (venv/)"]
+            LAPTOP_PROC["python ingestion_node.py\n─────────────────\n• Ingestion Workers (Selenium)\n• Browser Queue\n• ThreadPoolExecutor\n• Graceful shutdown (Ctrl+C)"]
         end
 
-        subgraph CHROME_BROWSER["Google Chrome (undetected-chromedriver)"]
-            SELENIUM["Selenium Browser Session\n─────────────────\n• Managed by ingestion workers\n• Shared via Queue\n• Max 25 uses per instance\n• user_data_dir: ./chrome_profile/"]
+        subgraph LAPTOP_CHROME["Google Chrome"]
+            SELENIUM["undetected-chromedriver Sessions\n─────────────────\n• Max 25 uses per instance\n• Per-account chrome_profile_{handle}/\n• Multiple scraper accounts"]
         end
 
-        subgraph DOCKER["Docker Runtime"]
-            subgraph CONTAINER["synapse-judge Container"]
-                direction TB
-                CPP_COMPILER["g++ Compiler\n(C++23, -O2, -static)"]
-                JUDGE_EXEC["Sandboxed Executor\n─────────────────\n• Memory limit enforced\n• Stack limit: 256MB\n• Timeout: per-problem\n• Non-root user"]
-                PYTHON_CHECK["Python Checker\n(synapse.checker)"]
+        TUNNEL["SSH Tunnel\n─────────────────\nssh -L 5432:localhost:5432\n    dgx-jump -N"]
+    end
+
+    %% ============================
+    %% DGX NODE
+    %% ============================
+    subgraph DGX["🖥️ DGX Server (NVIDIA, Shared University Resource)"]
+
+        subgraph DOCKER_COMPOSE["Docker Compose Stack"]
+
+            subgraph PG_CONTAINER["Container: synapse-postgres"]
+                PG_SVC["PostgreSQL 16\n─────────────────\n• Port 5432\n• User: synapse\n• DB: synapse_db\n• Schemas: progress, workspace\n• Healthcheck: pg_isready\n• Volume: pgdata"]
+            end
+
+            subgraph PIPELINE_CONTAINER["Container: synapse-pipeline"]
+                PIPELINE_PROC["python main.py\n─────────────────\n• DISABLE_INGESTION=true\n• DATABASE_URL=postgresql://...\n• Calibration Workers\n• Analysis Workers (Gemini)\n• Implementation Workers (Groq)\n• VJS Workers (Docker subprocess)\n• CF Submission Workers\n• Assembly Workers\n• Optimizer Thread\n• KeyHealthMonitor Thread\n• DatabaseWriter Thread"]
             end
         end
 
-        subgraph SQLITE_FILES["SQLite Databases (WAL mode)"]
-            PDB[("progress.db\n─────────────────\nPipeline state, metrics,\nworker status, dynamic config\n~WAL with read concurrency")]
-            WDB[("workspace.db\n─────────────────\nIntermediate problem data,\noracle codes, pretests,\nVJS reports\n~Transient, cleaned on completion")]
+        subgraph DOCKER_JUDGE["Docker Runtime (Host)"]
+            JUDGE_CONTAINER["synapse-judge Containers\n─────────────────\n• Ephemeral (--rm)\n• g++ compiler (C++23)\n• Sandboxed executor\n• Memory limit enforced\n• Non-root user"]
         end
 
-        subgraph FS["File System"]
-            DATASET["dataset.jsonl\n(append-only, final output)"]
-            DVC_FILE["dataset.jsonl.dvc\n(DVC version pointer)"]
-            CHROME_PROF["chrome_profile/\n(persistent browser session)"]
-            TMP_DIRS["tmp/vjs_<problem>_*/\n(VJS temp compilation dirs)"]
-            ENV_FILE[".env\n(credentials, API keys)"]
+        subgraph DGX_FS["File System"]
+            DATA_DIR["/home/23uec552/Synapse/data/"]
+            DATASET["/home/23uec552/Synapse/dataset.jsonl"]
+            ENV_FILE["/home/23uec552/Synapse/.env\n(API keys, manual)"]
         end
     end
 
@@ -60,113 +53,124 @@ graph TB
     %% EXTERNAL SERVICES
     %% ============================
     subgraph INTERNET["🌐 Internet / External Services"]
-        CF_SVC["Codeforces\ncodeforces.com\n─────────────────\n• HTTPS (requests)\n• Selenium browser\n• Internal cookie API"]
-        GEMINI_SVC["Google Gemini API\ngenerativelanguage.googleapis.com\n─────────────────\n• Model: gemini-2.5-pro\n• HTTPS / gRPC"]
-        GROQ_SVC["Groq API\napi.groq.com\n─────────────────\n• Model: llama-3.3-70b-versatile\n• HTTPS / OpenAI-compatible"]
-        DVC_REMOTE["DVC Remote Storage\n(Google Drive / S3 / GCS)\n─────────────────\n• Optional backup\n• Triggered manually by operator"]
+        CF_SVC["Codeforces\ncodeforces.com\n─────────────────\n• HTTPS (requests)\n• Selenium browser\n• Internal cookie API\n• Code submission (burner)"]
+        GEMINI_SVC["Google Gemini API\n─────────────────\n• Model: gemini-2.5-pro\n• Structured JSON output\n• Free tier: ~1500 RPD"]
+        GROQ_SVC["Groq API\n─────────────────\n• Model: DeepSeek-V3.2\n• Rate limit headers parsed\n• Free tier: ~14400 RPD"]
+        GITHUB["GitHub\n─────────────────\n• Code deployment\n• git push / git pull"]
+        DVC_REMOTE["DVC Remote Storage"]
     end
 
     %% ============================
     %% CONNECTIONS
     %% ============================
-    PROC_MAIN -->|"requests + Selenium\nHTTPS"| CF_SVC
-    PROC_MAIN -->|"Gemini SDK\nHTTPS"| GEMINI_SVC
-    PROC_MAIN -->|"Groq SDK\nHTTPS"| GROQ_SVC
+    LAPTOP_PROC -->|"Selenium\nHTTPS"| CF_SVC
+    LAPTOP_PROC <-->|"SSH tunnel\n:5432"| PG_SVC
+    TUNNEL -.->|"Encrypted tunnel"| PG_SVC
 
-    PROC_MAIN -->|"subprocess docker run\n(compile + execute)"| DOCKER
-    PROC_MAIN <-->|"WAL read/write"| PDB
-    PROC_MAIN <-->|"sync read/write"| WDB
-    PROC_MAIN -->|"append records"| DATASET
+    PIPELINE_PROC -->|"Gemini SDK\nHTTPS"| GEMINI_SVC
+    PIPELINE_PROC -->|"Groq SDK\nHTTPS"| GROQ_SVC
+    PIPELINE_PROC -->|"Selenium (CF submit)\nHTTPS"| CF_SVC
+    PIPELINE_PROC -->|"subprocess docker run"| JUDGE_CONTAINER
+    PIPELINE_PROC <-->|"Docker network\n:5432"| PG_SVC
+    PIPELINE_PROC -->|"append records"| DATASET
 
-    PROC_OPT <-->|"read/write dynamic_config"| PDB
-    PROC_DASH -->|"read-only mode"| PDB
+    ENV_FILE -->|"loaded at startup"| PIPELINE_PROC
 
-    DATASET --> DVC_FILE -->|"dvc push (manual)"| DVC_REMOTE
-    ENV_FILE -->|"credentials loaded\nat startup"| PROC_MAIN
+    LAPTOP -->|"git push"| GITHUB
+    GITHUB -->|"git pull (make dgx-pull)"| DGX
 
-    DOCKER -->|"volume mount\n(read/write)"| TMP_DIRS
-    CHROME_BROWSER -->|"persistent session"| CHROME_PROF
-    PROC_MAIN --> CHROME_BROWSER
+    DATASET --> DVC_REMOTE
 ```
 
 ---
 
-## Deployment Configuration Summary
+## Deployment Configuration
 
 ### Process Inventory
 
-| Process | Command | Role | Restartable? |
-|---------|---------|------|-------------|
-| Main Orchestrator | `python main.py` | Pipeline dispatch + worker threads | ✅ Yes (stateful DB) |
-| Optimizer | `python synapse/optimizer.py` | Self-tuning loop | ✅ Yes |
-| Dashboard | `python status.py` | Monitoring only | ✅ Yes |
+| Machine | Process | Command | Role |
+|---------|---------|---------|------|
+| Laptop | Ingestion Node | `python ingestion_node.py` | Scrapes CF, writes to PG via tunnel |
+| Laptop | SSH Tunnel | `make tunnel` | Forwards DGX:5432 to localhost:5432 |
+| DGX (Docker) | PostgreSQL | `docker compose up` service: postgres | Shared database |
+| DGX (Docker) | Pipeline | `docker compose up` service: synapse | All processing stages + optimizer |
 
-### Port & Network Usage
+### Network Topology
 
-| Component | Protocol | Direction | Endpoint |
-|-----------|----------|-----------|----------|
-| Codeforces scraper (requests) | HTTPS | Outbound | `codeforces.com` |
-| Codeforces scraper (Selenium) | HTTPS | Outbound | `codeforces.com` |
-| Gemini API | HTTPS/gRPC | Outbound | `generativelanguage.googleapis.com` |
-| Groq API | HTTPS | Outbound | `api.groq.com` |
-| Docker daemon | Unix Socket | Local | `/var/run/docker.sock` |
-| SQLite databases | File I/O | Local | `./progress.db`, `./workspace.db` |
+| From | To | Protocol | Port | Purpose |
+|------|----|----------|------|---------|
+| Laptop | Codeforces | HTTPS | 443 | Scraping |
+| Laptop | DGX | SSH | 22 | Tunnel to PostgreSQL |
+| Pipeline Container | PostgreSQL Container | TCP | 5432 | Docker internal network |
+| Pipeline Container | Gemini API | HTTPS | 443 | Analysis prompts |
+| Pipeline Container | Groq API | HTTPS | 443 | Implementation prompts |
+| Pipeline Container | Docker Daemon | Unix Socket | — | VJS judge calls |
+| Pipeline Container | Codeforces | HTTPS | 443 | CF Submission Worker |
+| Laptop | GitHub | HTTPS | 443 | Code deployment |
 
-> **Note:** Project Synapse opens **no inbound network ports**. It is a purely outbound, client-side application.
+> **Note:** Neither machine opens inbound ports to the internet. DGX PostgreSQL is only reachable via SSH tunnel or Docker internal network.
 
-### Resource Requirements
+### Resource Usage (Courtesy Guidelines)
 
-| Resource | Minimum | Recommended |
-|----------|---------|-------------|
-| CPU Cores | 4 | 8+ |
-| RAM | 8 GB | 16 GB |
-| Disk Space | 5 GB | 20 GB+ |
-| Docker Memory per container | 256 MB (configurable) | — |
-| Python Version | 3.10 | 3.11+ |
-| Google Chrome | Latest stable | — |
+| Scenario | Our CPU Target | Workers | Mode |
+|----------|---------------|---------|------|
+| DGX idle (CPU < 20%) | Up to 50% | Full scale | Burst Mode |
+| DGX moderate (20-70%) | ~30% | Proportional | Normal Mode |
+| DGX busy (CPU > 70%) | < 15% | Minimum | Courtesy Mode |
+| Off-peak hours (2am-6am) | Up to 60% | Maximum | Scheduled Burst |
 
 ### Environment Variables (`.env`)
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `GEMINI_API_KEYS` | ✅ | Comma-separated Gemini API keys |
-| `GROQ_API_KEYS` | ✅ | Comma-separated Groq API keys |
-| `CF_HANDLE` | ✅ | Codeforces login handle |
-| `CF_PASSWORD` | ✅ | Codeforces login password |
-| `MY_USER_AGENT` | ✅ | HTTP User-Agent string for respectful scraping |
+| Variable | Machine | Description |
+|----------|---------|-------------|
+| `GEMINI_API_KEYS` | DGX | Comma-separated Gemini API keys |
+| `GROQ_API_KEYS` | DGX | Comma-separated Groq API keys |
+| `DATABASE_URL` | Both | PostgreSQL connection string |
+| `DISABLE_INGESTION` | DGX | `true` — skip ingestion/calibration imports |
+| `CF_ACCOUNTS` | Laptop | `handle1:pass1,handle2:pass2` |
+| `CF_SUBMISSION_ACCOUNTS` | DGX | Burner accounts for CF submission worker |
 
-### Docker Image (`synapse-judge`)
+### Deployment Workflow
 
-| Property | Value |
-|----------|-------|
-| Base Image | Minimal Debian/Alpine with GCC |
-| Tag | `synapse-judge` |
-| Build Command | `docker build -t synapse-judge .` |
-| Ports Exposed | None |
-| Run Mode | `--rm` (ephemeral, auto-deleted after each run) |
-| User | Non-root (`--user uid:gid`) |
-| Memory Limit | `--memory=<memory_limit_kb>k` (per-problem) |
-| Stack Limit | `--ulimit stack=268435456` (256 MB) |
-| Volume Mounts | `/app` — problem temp directory (read-only for execution) |
+```
+                 LAPTOP                          DGX
+                   │                              │
+  1. Edit code     │                              │
+  2. Run tests     │                              │
+  3. git push      │────── GitHub ──────────────►  │
+                   │                              │  4. make dgx-pull
+                   │                              │  5. make dgx-up (rebuild)
+                   │                              │
+  6. make tunnel   │ ═════ SSH tunnel ═══════════► │
+  7. python        │                              │  (pipeline auto-restarts
+     ingestion_    │ ◄═══ PostgreSQL queries ═══► │   with new code)
+     node.py       │                              │
+```
 
 ### Startup Order
 
 ```
-1. docker build -t synapse-judge .
-2. python create_database.py          (one-time)
-3. python main.py                     (Terminal 1)
-4. python synapse/optimizer.py        (Terminal 2)
-5. python status.py                   (Terminal 3)
+# DGX (one-time setup)
+1. ssh dgx-jump
+2. git clone https://github.com/Axe-08/Synapse.git
+3. cd Synapse && git checkout new_archi
+4. Create .env with API keys + DATABASE_URL + DISABLE_INGESTION=true
+5. docker compose up -d
+6. DATABASE_URL=... python create_database.py --postgres
+
+# DGX (every session)
+1. make dgx-pull           (laptop terminal)
+2. make dgx-up             (laptop terminal)
+
+# LAPTOP (every session)
+1. make tunnel              (background terminal)
+2. python ingestion_node.py (main terminal)
 ```
 
-### Shutdown Procedure
+### Shutdown
 
 ```
-1. Press Ctrl+C in Terminal 1 (main.py)
-   → main.py catches KeyboardInterrupt
-   → Gracefully drains all ThreadPoolExecutors
-   → Quits all active browser instances
-   → Stops DatabaseWriter thread
-   → All in-progress problems reset on next startup
-2. Press Ctrl+C in Terminal 2 (optimizer.py) and Terminal 3 (status.py)
+1. Ctrl+C on ingestion_node.py (laptop) → graceful drain
+2. make dgx-down (laptop) → stops Docker containers
+3. Ctrl+C on tunnel terminal
 ```

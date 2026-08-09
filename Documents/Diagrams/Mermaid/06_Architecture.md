@@ -1,66 +1,70 @@
-# System Architecture Diagram — Project Synapse
+# System Architecture Diagram — Project Synapse v2.0
 
 ---
 
-## High-Level System Architecture
+## High-Level System Architecture (Hybrid)
 
 ```mermaid
 graph TB
     %% =====================
-    %% OPERATOR LAYER
+    %% LAPTOP NODE
     %% =====================
-    subgraph OPERATOR_LAYER["👤 Operator Interface Layer"]
-        ENV[".env Credentials File"]
-        CLI_MAIN["python main.py\n(CLI Entry Point)"]
-        CLI_OPT["python synapse/optimizer.py\n(Optimizer Process)"]
-        CLI_STATUS["python status.py\n(Live Dashboard)"]
-    end
-
-    %% =====================
-    %% ORCHESTRATION LAYER
-    %% =====================
-    subgraph ORCH_LAYER["🎛️ Orchestration Layer (main.py)"]
-        direction LR
-        GEMINI_KM["KeyManager\n(Gemini Keys)"]
-        GROQ_KM["KeyManager\n(Groq Keys)"]
-        KHM["KeyHealthMonitor\nThread"]
-        POOLS["ThreadPoolExecutor\nPools (per stage)"]
-        CFG["ConfigManager\n(Singleton)"]
-        DB_WRITER["DatabaseWriter\n(Singleton Thread)"]
-    end
-
-    %% =====================
-    %% PIPELINE STAGES
-    %% =====================
-    subgraph PIPELINE_LAYER["⚙️ Pipeline Stage Workers (workers.py)"]
-        direction LR
-        W1["ingestion_worker\n× 1-2 threads"]
-        W2["calibration_worker\n× 1-2 threads"]
-        W3["analysis_worker\n× 1-8 threads"]
-        W4["implementation_worker\n× 1-8 threads"]
-        W5["vjs_worker\n× 1-4 threads"]
-        W6["data_assembly_worker\n× 1-2 threads"]
-    end
-
-    %% =====================
-    %% SERVICES LAYER
-    %% =====================
-    subgraph SERVICES_LAYER["🛠️ Internal Services"]
+    subgraph LAPTOP["💻 Laptop Node"]
+        ING_NODE["ingestion_node.py\n(Ingestion Entry Point)"]
         SCRAPER["scraper.py\nHybrid Web Scraper"]
-        CHECKER["checker.py\nOutput Validator"]
-        API_CLIENTS["api_clients.py\nLLM API Adapter"]
-        VJS_MOD["vjs.py\nVJS Controller"]
-        DATA_ASM["data_assembly.py\nRecord Assembler"]
-        DATA_MGR["data_manager.py\nFile Writer"]
+        ACCT_MGR["account_manager.py\nScraper Account Rotation"]
+        CHROME["Chrome Browser\n(undetected-chromedriver)"]
+    end
+
+    %% =====================
+    %% DGX NODE
+    %% =====================
+    subgraph DGX["🖥️ DGX Server (Docker)"]
+
+        subgraph ORCH_LAYER["🎛️ Orchestration Layer (main.py)"]
+            direction LR
+            GEMINI_KM["KeyManager\n(Gemini Keys)\n+ Budget Tracker"]
+            GROQ_KM["KeyManager\n(Groq Keys)\n+ Budget Tracker"]
+            KHM["KeyHealthMonitor\nThread"]
+            POOLS["ThreadPoolExecutor\nDynamic Pools"]
+            CFG["ConfigManager\n(Singleton)"]
+            DB_WRITER["DatabaseWriter\n(Singleton Thread)"]
+        end
+
+        subgraph OPTIMIZER["🧠 Optimizer Module"]
+            OPT_ENGINE["Decision Engine\n(every 30s)"]
+            OPT_INPUTS["Inputs:\n• Queue depths\n• DGX CPU/RAM\n• API budgets\n• Scraper stats\n• Stage durations\n• Time of day"]
+        end
+
+        subgraph PIPELINE_LAYER["⚙️ Pipeline Workers (synapse/workers/)"]
+            direction LR
+            W2["calibration_worker\n× 0-2 threads"]
+            W3["analysis_worker\n× 0-8 threads"]
+            W4["implementation_worker\n× 0-8 threads"]
+            W5["vjs_worker\n× 0-4 threads"]
+            W7["cf_submission_worker\n× 0-2 threads"]
+            W6["data_assembly_worker\n× 0-2 threads"]
+        end
+
+        subgraph SERVICES_LAYER["🛠️ Internal Services"]
+            CHECKER["checker.py\nOutput Validator"]
+            API_CLIENTS["api_clients.py\nLLM API Adapter"]
+            VJS_MOD["vjs.py\nVJS Controller + Fuzz"]
+            DATA_ASM["data_assembly.py\nRecord Assembler"]
+            DATA_MGR["data_manager.py\nFile Writer"]
+        end
+
+        subgraph DOCKER_JUDGE["🐳 Docker Judge"]
+            JUDGE["synapse-judge\n(g++ -O2 -std=c++23)"]
+        end
     end
 
     %% =====================
     %% DATA LAYER
     %% =====================
-    subgraph DATA_LAYER["💾 Data Layer"]
-        PROGRESS_DB[("progress.db\n(Pipeline State)\nSQLite WAL")]
-        WORKSPACE_DB[("workspace.db\n(Intermediate Cache)\nSQLite WAL")]
-        DATASET["dataset.jsonl\n(Final Output)\nAppend-only"]
+    subgraph DATA["💾 Data Layer"]
+        PG[("PostgreSQL 16\nprogress + workspace\nschemas")]
+        DATASET["dataset.jsonl\n(Final Output)"]
         DVC["DVC Pointer\ndataset.jsonl.dvc"]
     end
 
@@ -69,70 +73,73 @@ graph TB
     %% =====================
     subgraph EXTERNAL["🌐 External Systems"]
         CF["Codeforces\nhttps://codeforces.com"]
-        GEMINI_API["Google Gemini API\ngemini-2.5-pro"]
-        GROQ_API["Groq API\nllama-3.3-70b-versatile"]
-        DOCKER["Docker Daemon\nsynapse-judge image"]
-        DVC_REMOTE["DVC Remote Storage\n(Google Drive or S3)"]
+        GEMINI_API["Google Gemini API\ngemini-2.5-pro\n(structured output)"]
+        GROQ_API["Groq API\nDeepSeek-V3.2"]
+        DVC_REMOTE["DVC Remote Storage"]
     end
 
     %% =====================
     %% CONNECTIONS
     %% =====================
-    CLI_MAIN --> ORCH_LAYER
-    CLI_OPT --> CFG
-    CLI_STATUS --> PROGRESS_DB
+    ING_NODE --> SCRAPER
+    SCRAPER --> ACCT_MGR
+    SCRAPER --> CHROME
+    CHROME --> CF
+    ING_NODE <-->|"SSH tunnel\n:5432"| PG
 
     ORCH_LAYER --> PIPELINE_LAYER
+    OPTIMIZER --> CFG
+    OPT_INPUTS --> OPT_ENGINE
+    OPT_ENGINE --> CFG
+
     GEMINI_KM --> W3
     GROQ_KM --> W4
     KHM --> GEMINI_KM & GROQ_KM
-    POOLS --> W1 & W2 & W3 & W4 & W5 & W6
     CFG --> POOLS
+    POOLS --> W2 & W3 & W4 & W5 & W6 & W7
 
-    W1 --> SCRAPER
     W2 --> VJS_MOD
     W3 --> API_CLIENTS
     W4 --> API_CLIENTS
     W5 --> VJS_MOD & CHECKER
     W6 --> DATA_ASM & DATA_MGR
+    W7 --> CF
 
-    SCRAPER --> CF
     API_CLIENTS --> GEMINI_API & GROQ_API
-    VJS_MOD --> DOCKER
-    CHECKER --> DOCKER
+    VJS_MOD --> JUDGE
 
-    PIPELINE_LAYER --> DATA_LAYER
-    DB_WRITER --> PROGRESS_DB
-    W1 & W2 --> WORKSPACE_DB
-    W3 & W4 --> WORKSPACE_DB
-    W5 --> WORKSPACE_DB
+    DB_WRITER --> PG
+    W2 & W3 & W4 & W5 & W6 & W7 --> PG
     W6 --> DATASET
-    W6 --> WORKSPACE_DB
-
     DATASET --> DVC --> DVC_REMOTE
-    ENV --> ORCH_LAYER
 ```
 
 ---
 
-## Self-Tuning Feedback Loop Architecture
+## Optimizer Feedback Loop Architecture
 
 ```mermaid
 graph LR
-    subgraph MEASUREMENTS["📊 Measurement"]
-        MET["metrics table\n(success rates, durations)"]
+    subgraph INPUTS["📊 Optimizer Inputs"]
         QUEUES["Queue Depths\n(pending_* counts)"]
-        BAN["IP Ban Detection\n(scrape_blocked events)"]
+        CPU["DGX CPU/RAM\n(psutil)"]
+        API_BUDGET["API Budget\n(RPM/RPD/TPM/TPD\nper key per service)"]
+        SCRAPER_TEL["Scraper Telemetry\n(bans, rates,\naccount health)"]
+        STAGE_DUR["Stage Durations\n(avg ms per stage)"]
+        HISTORY["Historical Patterns\n(dgx_usage_stats)"]
     end
 
-    subgraph OPTIMIZER["🧠 Optimizer (optimizer.py)"]
-        AIMD_C["AIMD Controller\n(analysis_worker_count)"]
-        P_CTRL["P-Controller\n(VJS queue balancing)"]
-        PANIC["PANIC MODE\n(IP ban response)"]
-        THROTTLE["Scraper Throttle\n(delay_seconds)"]
+    subgraph OPTIMIZER["🧠 Optimizer"]
+        SKIP["Stage Skipping\n(0 queue → 0 workers)"]
+        COURTESY["Courtesy Mode\n(CPU>70% → scale down)"]
+        BURST["Burst Mode\n(CPU<20% → scale up)"]
+        BACKPRESSURE["Backpressure\n(downstream > 2× upstream\n→ throttle upstream)"]
+        API_THROTTLE["API Throttle\n(>90% TPD → slow\n>98% TPD → stop)"]
+        PANIC["PANIC Mode\n(IP ban → ingestion=0)"]
+        SCHEDULE["Time Schedule\n(low-usage hours → burst)"]
     end
 
-    subgraph EFFECTORS["⚙️ Effectors (main.py)"]
+    subgraph EFFECTORS["⚙️ Effectors"]
         DYN_CFG[("dynamic_config\ntable")]
         POOL_MGR["manage_pools()\n(resize ThreadPools)"]
     end
@@ -141,67 +148,74 @@ graph LR
         WORKERS["Active Worker\nThreads"]
     end
 
-    WORKERS --> MET
-    WORKERS --> QUEUES
-    WORKERS --> BAN
+    QUEUES --> SKIP & BACKPRESSURE & BURST
+    CPU --> COURTESY & BURST
+    API_BUDGET --> API_THROTTLE
+    SCRAPER_TEL --> PANIC
+    STAGE_DUR --> BACKPRESSURE
+    HISTORY --> SCHEDULE
 
-    MET --> AIMD_C & THROTTLE
-    QUEUES --> P_CTRL
-    BAN --> PANIC
-
-    AIMD_C --> DYN_CFG
-    P_CTRL --> DYN_CFG
-    PANIC --> DYN_CFG
-    THROTTLE --> DYN_CFG
+    SKIP & COURTESY & BURST & BACKPRESSURE --> DYN_CFG
+    API_THROTTLE & PANIC & SCHEDULE --> DYN_CFG
 
     DYN_CFG --> POOL_MGR
     POOL_MGR --> WORKERS
+    WORKERS --> QUEUES & STAGE_DUR
 ```
 
 ---
 
-## Concurrency Architecture
+## Concurrency Architecture (Hybrid)
 
 ```mermaid
 graph TD
-    subgraph MAIN_THREAD["Main Thread"]
-        MAIN_LOOP["Dispatch Loop\n(every 10-20s)"]
-        POOL_MGR["manage_pools()"]
-    end
-
-    subgraph BG_THREADS["Background Daemon Threads"]
-        KHM_T["KeyHealthMonitor\n(every 10s)"]
-        DBW_T["DatabaseWriter\n(queue consumer)"]
-    end
-
-    subgraph EXT_POOLS["External Process"]
-        OPT_P["Optimizer Process\n(every 60s)"]
-        DASH_P["Status Dashboard Process\n(every 2s)"]
-    end
-
-    subgraph THREADPOOLS["ThreadPoolExecutors (per stage)"]
+    subgraph LAPTOP_PROC["Laptop Process: python ingestion_node.py"]
+        ING_MAIN["Main Thread"]
         ING_POOL["Ingestion Pool\n1-2 threads"]
-        CAL_POOL["Calibration Pool\n1-2 threads"]
-        ANA_POOL["Analysis Pool\n1-8 threads"]
-        IMP_POOL["Implementation Pool\n1-8 threads"]
-        VJS_POOL["VJS Pool\n1-4 threads"]
-        ASM_POOL["Assembly Pool\n1-2 threads"]
+        ING_BQ["Browser Queue\n(Selenium drivers)"]
     end
 
-    subgraph INNER_POOLS["Inner Parallel Executions"]
-        SCRAPER_POOL["CF API Scraper\nThreadPoolExecutor\n(5 workers)"]
-        ORACLE_POOL["Oracle Runner\nThreadPoolExecutor\n(N oracle workers)"]
+    subgraph DGX_CONTAINER["DGX Container: python main.py"]
+        subgraph MAIN_THREAD["Main Thread"]
+            MAIN_LOOP["Dispatch Loop\n(every 10-20s)"]
+            POOL_MGR["manage_pools()"]
+            OPT_THREAD["Optimizer Thread\n(every 30s)"]
+        end
+
+        subgraph BG_THREADS["Background Threads"]
+            KHM_T["KeyHealthMonitor\n(every 10s)"]
+            DBW_T["DatabaseWriter\n(queue consumer)"]
+        end
+
+        subgraph THREADPOOLS["ThreadPoolExecutors"]
+            CAL_POOL["Calibration 0-2"]
+            ANA_POOL["Analysis 0-8"]
+            IMP_POOL["Implementation 0-8"]
+            VJS_POOL["VJS 0-4"]
+            CF_POOL["CF Submit 0-2"]
+            ASM_POOL["Assembly 0-2"]
+        end
+
+        subgraph INNER["Inner Parallel"]
+            ORACLE_POOL["Oracle Runner\n(N workers)"]
+            FUZZ_POOL["Fuzz Generator\n(sequential)"]
+        end
     end
 
-    MAIN_THREAD -->|"submits"| ING_POOL & CAL_POOL & ANA_POOL & IMP_POOL & VJS_POOL & ASM_POOL
-    MAIN_THREAD --> BG_THREADS
-    DBW_T -->|"serial writes"| SQLITE["progress.db\n(WAL mode)"]
+    subgraph DGX_POSTGRES["DGX: PostgreSQL Container"]
+        PG[("PostgreSQL 16\nFOR UPDATE\nSKIP LOCKED")]
+    end
 
-    ING_POOL -->|"uses"| SCRAPER_POOL
-    VJS_POOL -->|"uses"| ORACLE_POOL
+    ING_MAIN --> ING_POOL
+    ING_POOL --> ING_BQ
 
-    OPT_P -->|"reads/writes dynamic_config"| SQLITE
-    DASH_P -->|"reads (read-only)"| SQLITE
+    MAIN_THREAD -->|"submits"| CAL_POOL & ANA_POOL & IMP_POOL & VJS_POOL & CF_POOL & ASM_POOL
+    VJS_POOL -->|"uses"| ORACLE_POOL & FUZZ_POOL
+
+    ING_POOL <-->|"SSH tunnel\n:5432"| PG
+    DBW_T -->|"serial writes"| PG
+    THREADPOOLS <-->|"Docker network\n:5432"| PG
+    OPT_THREAD --> PG
 ```
 
 ---
@@ -209,14 +223,19 @@ graph TD
 ## File System Layout
 
 ```
-axe-08-synapse/
+Synapse/
 │
-├── main.py                 ← Orchestrator entry point
-├── config.py               ← Static configuration constants  
+├── main.py                 ← DGX orchestrator entry point
+├── ingestion_node.py       ← Laptop ingestion entry point
+├── config.py               ← Static configuration constants
 ├── status.py               ← Live terminal dashboard
-├── create_database.py      ← One-time DB initializer
-├── Dockerfile              ← synapse-judge image definition
-├── requirements.txt        ← Python dependencies
+├── create_database.py      ← DB initializer (--postgres flag)
+├── Makefile                ← Deployment automation
+├── Dockerfile              ← synapse-judge image
+├── Dockerfile.pipeline     ← DGX pipeline container
+├── docker-compose.yml      ← DGX: postgres + pipeline
+├── requirements.txt        ← Full dependencies (laptop)
+├── requirements-pipeline.txt ← Slim dependencies (DGX)
 ├── .env                    ← API keys + credentials (gitignored)
 │
 ├── synapse/                ← Core pipeline package
@@ -226,30 +245,33 @@ axe-08-synapse/
 │   ├── config_manager.py   ← Singleton dynamic config
 │   ├── data_assembly.py    ← Golden record builder
 │   ├── data_manager.py     ← dataset.jsonl writer
-│   ├── database.py         ← Data Access Layer (DAL)
-│   ├── database_writer.py  ← Async SQLite write queue
-│   ├── key_manager.py      ← API key pool manager
-│   ├── optimizer.py        ← Self-tuning optimizer
+│   ├── database.py         ← DAL (PostgreSQL + SQLite adapter)
+│   ├── database_writer.py  ← Async write queue (PG/SQLite)
+│   ├── key_manager.py      ← API key pool + budget tracker
+│   ├── optimizer.py        ← Intelligent optimizer module
 │   ├── scraper.py          ← Codeforces hybrid scraper
+│   ├── account_manager.py  ← Scraper account rotation
 │   ├── vjs.py              ← Docker judge controller
-│   └── workers.py          ← All stage worker functions
+│   └── workers/            ← Pipeline worker package
+│       ├── __init__.py     ← Conditional imports (DISABLE_INGESTION)
+│       ├── _shared.py      ← Helpers + common imports
+│       ├── ingestion.py    ← ingestion_worker()
+│       ├── calibration.py  ← calibration_worker()
+│       ├── analysis.py     ← analysis_worker()
+│       ├── implementation.py ← implementation_worker()
+│       ├── vjs.py          ← vjs_worker() + fuzz generator
+│       ├── cf_submission.py ← cf_submission_worker()
+│       └── assembly.py     ← data_assembly_worker()
 │
-├── progress.db             ← Pipeline state (SQLite)
-├── workspace.db            ← Intermediate cache (SQLite)
-├── dataset.jsonl           ← Final output dataset
-├── dataset.jsonl.dvc       ← DVC version pointer
+├── tests/
+│   ├── conftest.py         ← Shared fixtures (temp DB, sync writer)
+│   ├── unit/               ← 56 unit tests
+│   ├── integration/        ← 14 integration tests
+│   └── e2e/                ← Pipeline smoke test
 │
-├── .dvc/                   ← DVC configuration
-├── chrome_profile/         ← Persistent Selenium session
-├── data/                   ← (DVC-tracked data directory)
-└── Documents/              ← Project documentation
-    ├── SRS.md
-    └── Diagrams/
-        ├── 01_DFD.md
-        ├── 02_ERD.md
-        ├── 03_UseCases.md
-        ├── 04_SequenceDiagrams.md
-        ├── 05_ClassDiagram.md
-        ├── 06_Architecture.md
-        └── 07_Deployment.md
+└── Documents/
+    ├── SRS.md              ← v1 (preserved)
+    └── v2/                 ← v2 documentation
+        ├── SRS.md
+        └── Diagrams/
 ```
