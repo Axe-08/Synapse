@@ -13,8 +13,9 @@ import os
 from .calibration import calibration_worker
 from .analysis import analysis_worker
 from .implementation import implementation_worker
+from .fuzz_generator import fuzz_generator_worker
 from .vjs import vjs_worker
-from .assembly import data_assembly_worker
+from .data_assembly import data_assembly_worker
 
 # Only import ingestion on the laptop (DISABLE_INGESTION not set, or false)
 _disable_ingestion = os.getenv('DISABLE_INGESTION', 'false').lower() == 'true'
@@ -30,6 +31,7 @@ __all__ = [
     "ingestion_worker",
     "calibration_worker",
     "analysis_worker",
+    "fuzz_generator_worker",
     "implementation_worker",
     "vjs_worker",
     "data_assembly_worker",
