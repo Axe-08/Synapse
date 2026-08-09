@@ -1,16 +1,60 @@
-# Environment variables
+# ── Credentials & Secrets ────────────────────────────────────────────────────
 .env
 
-# Python virtual environment
+# ── Python ────────────────────────────────────────────────────────────────────
 venv/
-
-# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
 
-# IDE and OS files
+# ── IDE & OS ──────────────────────────────────────────────────────────────────
 .idea/
 .vscode/
 *.DS_Store
+*.swp
+*.swo
 
+# ── Browser / Scraper ephemeral ───────────────────────────────────────────────
 cookies.json
+chrome_profile*/
+*.log
+
+# ── Debug artefacts (screenshots, caches) ────────────────────────────────────
+debug_*.png
+debug_webdriver_failure.png
+debug_problem_statement_missing.png
+debug_v2_cache*.json
+debug_login_failure.png
+key_checker_report.json
+
+# ── DVC ───────────────────────────────────────────────────────────────────────
+.dvc/cache
+.dvc/tmp
+
+# ── Runtime databases & data ──────────────────────────────────────────────────
+/dataset.jsonl
+/data/
+/progress.db
+*.db
+*.db-wal
+*.db-shm
+
+# ── Test / pytest ─────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Backup / deprecated ───────────────────────────────────────────────────────
+_backup/
+temp_vjs/
+
+# ── LLM context (deprecated) ─────────────────────────────────────────────────
+/llm.txt
+
+# ── Temporary solution & record files ────────────────────────────────────────
+scraped_data_cache.json

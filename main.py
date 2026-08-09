@@ -1,57 +1,288 @@
-# main.py (Final Clean Version for Phase 1)
-
+# main.py
+"""
+The main entry point and orchestrator for the Project Synapse pipeline.
+This script initializes all components, including the database writer,
+configuration manager, and API key managers. It creates and manages thread
+pools for each stage of the pipeline (Ingestion, Analysis, Implementation,
+VJS, Data Assembly).
+The main loop periodically queries the database for pending jobs in each
+stage and submits them to the appropriate worker pool. It is designed for
+continuous, resilient operation and graceful shutdown on KeyboardInterrupt.
+"""
 import argparse
 import logging
+import time
+import threading
+import os
+from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+from queue import Queue
 
-# Set up basic logging
+# --- Configuration & Setup ---
 logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s'
 )
 
-from synapse.database import get_problem_status, update_problem_status
-from synapse.scraper import fetch_problem_data
+# Import from our project modules
+from synapse import database as db
+from synapse.key_manager import KeyManager
+from synapse.workers import (
+    ingestion_worker,
+    calibration_worker, # FEATURE: Added calibration worker
+    analysis_worker,
+    fuzz_generator_worker,
+    implementation_worker,
+    vjs_worker,
+    cf_submission_worker,
+    data_assembly_worker
+)
+from synapse.database_writer import db_writer
+from synapse.config_manager import config_manager
+from synapse.optimizer import PipelineOptimizer
+
+# --- Load Environment Variables ---
+load_dotenv()
+GEMINI_API_KEYS: list[str] = [key.strip() for key in os.getenv('GEMINI_API_KEYS', '').split(',') if key.strip()]
+GROQ_API_KEYS: list[str] = [key.strip() for key in os.getenv('GROQ_API_KEYS', '').split(',') if key.strip()]
+DISABLE_INGESTION: bool = os.getenv('DISABLE_INGESTION', 'false').lower() == 'true'
+if not GEMINI_API_KEYS or not GROQ_API_KEYS:
+    logging.warning("API keys not found in .env file. ARL workers may fail.")
+if DISABLE_INGESTION:
+    logging.info("DISABLE_INGESTION=true — running as DGX node (no scraping).")
+
+def key_health_monitor(stop_event: threading.Event, gemini_km: KeyManager, groq_km: KeyManager) -> None:
+    """
+    A background thread that periodically triggers the internal state-check
+    mechanism in the KeyManagers. This helps reset rate-limit windows and
+    cooldowns, ensuring keys become available again over time.
+    Args:
+        stop_event: An event to signal when the thread should terminate.
+        gemini_km: The KeyManager instance for Gemini keys.
+        groq_km: The KeyManager instance for Groq keys.
+    """
+    while not stop_event.is_set():
+        try:
+            with gemini_km._lock:
+                gemini_km._check_and_reset_windows()
+            with groq_km._lock:
+                groq_km._check_and_reset_windows()
+        except Exception as e:
+            logging.warning(f"Key health monitor encountered an error: {e}")
+        
+        # Sleep for a short duration, checking the stop_event frequently
+        for _ in range(10):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+
+# BUGFIX: Helper function to manage dynamic pool resizing
+def manage_pools(current_pools: dict, current_counts: dict) -> tuple[dict, dict]:
+    """Checks config for worker count changes and resizes pools accordingly."""
+    # Get the latest desired counts from the now DB-backed config manager
+    desired_counts = {
+        'INGESTION': config_manager.get_param('ingestion_worker_count'),
+        'CALIBRATION': config_manager.get_param('ingestion_worker_count'), # Calibration runs at same rate as ingestion
+        'ANALYSIS': config_manager.get_param('analysis_worker_count'),
+        'FUZZ_GENERATOR': config_manager.get_param('fuzz_generator_worker_count'),
+        'IMPLEMENTATION': config_manager.get_param('implementation_worker_count'),
+        'VJS': config_manager.get_param('vjs_worker_count'),
+        'CF_SUBMISSION': config_manager.get_param('cf_submission_worker_count'),
+        'DATA_ASSEMBLY': config_manager.get_param('data_assembly_worker_count')
+    }
+
+    for stage_name, desired_count in desired_counts.items():
+        current_count = current_counts.get(stage_name, 0)
+        if desired_count != current_count:
+            logging.warning(f"CONFIG CHANGE: Resizing {stage_name} pool from {current_count} to {desired_count} workers.")
+            
+            # Shutdown the old pool if it exists
+            if stage_name in current_pools:
+                current_pools[stage_name].shutdown(wait=True)
+            
+            # Create a new pool with the desired size
+            if desired_count > 0:
+                current_pools[stage_name] = ThreadPoolExecutor(max_workers=desired_count, thread_name_prefix=stage_name.capitalize())
+            elif stage_name in current_pools:
+                del current_pools[stage_name] # Remove pool if count is zero
+            
+            current_counts[stage_name] = desired_count
+            
+    return current_pools, current_counts
 
 
-def process_problem(problem_id: str):
-    """The main pipeline function for processing a single problem."""
-    logging.info(f"Starting pipeline for problem: {problem_id}")
+def main(args: argparse.Namespace) -> None:
+    """
+    Manages worker pools for each pipeline stage, with dynamic configuration.
+    This function sets up the entire application state and enters a continuous
+    loop to dispatch jobs to worker threads.
+    Args:
+        args: Command-line arguments from argparse.
+    """
+    db.reset_all_workers_to_idle()
+    db_writer.start()
+    time.sleep(1)
+
+    # Initialize shared resources
+    gemini_key_manager = KeyManager(GEMINI_API_KEYS, "GEMINI")
+    groq_key_manager = KeyManager(GROQ_API_KEYS, "GROQ")
     
-    status = get_problem_status(problem_id)
-    if status == 'completed':
-        logging.warning(f"Problem {problem_id} is already marked as 'completed'. Skipping.")
-        return
-    if status == 'in_progress':
-        logging.warning(f"Problem {problem_id} is marked as 'in_progress'. Skipping to avoid conflicts.")
-        return
+    stop_event = threading.Event()
+    health_monitor_thread = threading.Thread(
+        target=key_health_monitor,
+        args=(stop_event, gemini_key_manager, groq_key_manager),
+        name="KeyHealthMonitor",
+        daemon=True
+    )
+    health_monitor_thread.start()
 
-    update_problem_status(problem_id, 'in_progress')
-    logging.info(f"Processing problem: {problem_id}")
+    # BUGFIX: Initialize Optimizer thread
+    optimizer = PipelineOptimizer(
+        gemini_km=gemini_key_manager,
+        groq_km=groq_key_manager,
+        # No account manager passed here as scraper polling is localized to ingestion_node
+    )
+    
+    def optimizer_loop():
+        from config import OPTIMIZER_LOOP_DELAY_SECONDS
+        while not stop_event.is_set():
+            try:
+                optimizer.optimize()
+            except Exception as e:
+                logging.error(f"Optimizer loop caught an error: {e}")
+            
+            # Sleep in small increments to allow quick shutdown
+            for _ in range(OPTIMIZER_LOOP_DELAY_SECONDS):
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
+
+    optimizer_thread = threading.Thread(
+        target=optimizer_loop,
+        name="OptimizerLoop",
+        daemon=True
+    )
+    optimizer_thread.start()
+
+    # BUGFIX: Initialize pool and count tracking dictionaries
+    # These will now be managed inside the loop to allow for dynamic resizing
+    active_pools = {}
+    worker_counts = {}
+
+    # Stage definitions — ingestion/calibration excluded on DGX
+    stage_definitions = {
+        'ANALYSIS': (analysis_worker, ('gemini_key_manager',)),
+        'FUZZ_GENERATOR': (fuzz_generator_worker, ('gemini_key_manager',)),
+        'IMPLEMENTATION': (implementation_worker, ('groq_key_manager',)),
+        'VJS': (vjs_worker, ()),
+        'CF_SUBMISSION': (cf_submission_worker, ()),
+        'DATA_ASSEMBLY': (data_assembly_worker, ()),
+    }
+    if not DISABLE_INGESTION:
+        stage_definitions = {
+            'INGESTION': (ingestion_worker, ('browser_queue',)),
+            'CALIBRATION': (calibration_worker, ()),
+            **stage_definitions,
+        }
 
     try:
-        # Step 1: Scrape all problem data
-        problem_data = fetch_problem_data(problem_id)
-        if not problem_data:
-            raise Exception("Failed to fetch problem data.")
+        # BUGFIX: The browser queue size must also be dynamic.
+        # We will manage the browser queue manually based on the ingestion worker count.
+        # Only create/fill browser queue on laptop (ingestion enabled)
+        browser_queue: Queue = Queue()
+        if DISABLE_INGESTION:
+            current_ingestion_workers = 0
 
-        logging.info(f"Successfully scraped '{problem_data['name']}'.")
-        logging.info(f"Found {len(problem_data['pretests'])} pretest(s).")
-        logging.info(f"Reference solution code is {len(problem_data['reference_solution_code'])} characters long.")
+        while not stop_event.is_set():
+            # BUGFIX: Sync config from DB at the start of each cycle
+            config_manager.sync_from_db()
+            
+            # BUGFIX: Manage worker pools dynamically
+            active_pools, worker_counts = manage_pools(active_pools, worker_counts)
+            
+            # BUGFIX: Adjust browser queue size to match ingestion workers
+            current_ingestion_workers = worker_counts.get('INGESTION', 0)
+            while browser_queue.qsize() < current_ingestion_workers:
+                browser_queue.put(None) # Add placeholders for new workers
+            
+            # This map holds the actual resource objects
+            resource_map = {
+                'browser_queue': browser_queue,
+                'gemini_key_manager': gemini_key_manager,
+                'groq_key_manager': groq_key_manager
+            }
 
-        # --- NEXT STEPS: ARL (LLM Calls) and VJS (Judge) will go here ---
+            current_analysis_batch_size = config_manager.get_param('analysis_batch_size')
+            current_fuzz_batch_size = config_manager.get_param('fuzz_batch_size')
+            logging.info(f"Cycle Start. Live Config: analysis_batch_size={current_analysis_batch_size}, fuzz_batch={current_fuzz_batch_size}, workers={worker_counts}")
+            
+            active_jobs = 0
+            for stage_name, pool in active_pools.items():
+                if not pool or pool._shutdown: continue
 
-        update_problem_status(problem_id, 'completed')
-        logging.info(f"Successfully processed and saved problem: {problem_id}")
+                worker_func, resource_names = stage_definitions[stage_name]
+                status_to_fetch = f"pending_{stage_name.lower()}"
+                
+                batch_size = 1
+                if stage_name == 'ANALYSIS':
+                    batch_size = current_analysis_batch_size
+                elif stage_name == 'FUZZ_GENERATOR':
+                    batch_size = current_fuzz_batch_size
 
-    except Exception as e:
-        logging.error(f"An error occurred while processing {problem_id}: {e}", exc_info=False)
-        update_problem_status(problem_id, 'failed')
+                # Fetch enough jobs to keep all workers in the pool busy
+                jobs_to_fetch = batch_size * pool._max_workers
+                jobs = db.get_next_jobs(status_to_fetch, jobs_to_fetch)
+                
+                if jobs:
+                    active_jobs += len(jobs)
+                    worker_args = [resource_map[name] for name in resource_names]
+                    
+                    if batch_size > 1:
+                        for j in range(0, len(jobs), batch_size):
+                            batch = jobs[j:j+batch_size]
+                            pool.submit(worker_func, batch, f"{stage_name}-{(j // batch_size) + 1}", *worker_args)
+                    else:
+                        for j, job in enumerate(jobs):
+                            pool.submit(worker_func, job, f"{stage_name}-{j + 1}", *worker_args)
 
-    logging.info(f"Pipeline finished for problem: {problem_id}")
+            if args.run_once:
+                logging.info("--run-once specified. Exiting after one cycle.")
+                break
+                
+            if not active_jobs:
+                logging.info("No pending jobs in any stage. Waiting...")
+                time.sleep(20)
+            else:
+                time.sleep(10)
 
+    except KeyboardInterrupt:
+        logging.info("Shutdown signal received. Stopping job dispatch...")
+    finally:
+        stop_event.set()
+        logging.info("Shutting down all worker pools...")
+        for stage_name, pool in active_pools.items():
+            if pool:
+                pool.shutdown(wait=True, cancel_futures=False)
+                logging.info(f"{stage_name.capitalize()} pool has shut down.")
+        
+        logging.info("Cleaning up browser instances...")
+        while not browser_queue.empty():
+            driver = browser_queue.get_nowait()
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+        
+        health_monitor_thread.join(timeout=5)
+        optimizer_thread.join(timeout=5)
+        db_writer.stop()
+        logging.info("All systems nominal. Project Synapse signing off.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Project Synapse pipeline.")
-    parser.add_argument("--problem_id", type=str, required=True, help="The Codeforces problem ID (e.g., '1A').")
+    parser.add_argument("--min_rating", type=int, help="Minimum rating of problems to ingest.")
+    parser.add_argument("--max_rating", type=int, help="Maximum rating of problems to ingest.")
+    parser.add_argument("--run-once", action='store_true', help="Run one cycle and then exit.")
     args = parser.parse_args()
-    process_problem(args.problem_id)
+    main(args)

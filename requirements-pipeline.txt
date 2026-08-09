@@ -1,0 +1,22 @@
+# requirements-pipeline.txt
+# DGX pipeline dependencies — excludes DVC, Selenium/Chrome, and DVC cloud deps
+# Use: venv/bin/pip install -r requirements-pipeline.txt
+
+# Core runtime
+python-dotenv
+requests
+
+# Database
+psycopg2-binary
+
+# Google Gemini (analysis worker)
+google-generativeai
+
+# Groq (implementation worker)
+groq
+
+# HTML parsing (ingestion/assembly)
+beautifulsoup4
+
+# Code quality analysis
+lizard

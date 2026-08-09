@@ -1,0 +1,48 @@
+services:
+  # ──────────────────────────────────────────────────────
+  #  PostgreSQL 16 — the shared message-bus database
+  # ──────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: synapse-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: synapse_db
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: synapse
+    ports:
+      - "5432:5432"
+    volumes:
+      - /home/23uec552/synapse-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U synapse -d synapse_db" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────────────
+  #  Synapse Pipeline — runs calibration through assembly
+  #  (ingestion runs on the laptop, not here)
+  # ──────────────────────────────────────────────────────
+  synapse:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    container_name: synapse-pipeline
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://synapse:synapse@postgres:5432/synapse_db
+      - DISABLE_INGESTION=true
+    env_file:
+      - path: .env
+        required: false # GEMINI_API_KEYS, GROQ_API_KEYS — create manually on DGX
+    volumes:
+      - /home/23uec552/Synapse/data:/app/data
+      - /home/23uec552/Synapse/dataset.jsonl:/app/dataset.jsonl
+      - /home/23uec552/synapse-judge-bin:/synapse-judge-bin:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /app
+    command: [ "python", "main.py" ]

@@ -1,0 +1,22 @@
+# Dockerfile.pipeline
+# Python pipeline image for DGX — runs all Synapse stages EXCEPT ingestion.
+# The existing Dockerfile is the synapse-judge sandbox; this is separate.
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps for psycopg2, lizard, and general build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libpq-dev curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python deps first (cached layer)
+COPY requirements-pipeline.txt .
+RUN pip install --no-cache-dir -r requirements-pipeline.txt
+
+# Copy source
+COPY . .
+
+# Default command — DGX always runs with ingestion disabled
+CMD ["python", "main.py"]
