@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS problems (
     reference_submissions_json TEXT,
     successful_oracles INTEGER DEFAULT 0,
     confidence_level INTEGER DEFAULT 0,
+    problem_class TEXT NOT NULL DEFAULT 'standard',
+    submission_account TEXT,
     last_vjs_report TEXT,
     notes TEXT,
     last_updated TEXT NOT NULL DEFAULT (datetime('now'))
@@ -72,6 +74,23 @@ CREATE TABLE IF NOT EXISTS dynamic_config (
     value TEXT NOT NULL DEFAULT '',
     last_updated TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS scraper_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account TEXT NOT NULL,
+    timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+    event_type TEXT NOT NULL,
+    details_json TEXT DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS dgx_usage_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+    hour INTEGER NOT NULL,
+    weekday INTEGER NOT NULL,
+    cpu_percent REAL,
+    ram_percent REAL,
+    our_active_workers INTEGER,
+    queue_depth INTEGER
+);
 """
 
 WORKSPACE_SCHEMA = """
@@ -93,7 +112,9 @@ CREATE TABLE IF NOT EXISTS problem_data_cache (
     memory_limit_raw TEXT DEFAULT '256 megabytes',
     vjs_last_report TEXT,
     last_vjs_report TEXT,
-    oracle_count INTEGER DEFAULT 0
+    oracle_count INTEGER DEFAULT 0,
+    input_generator_py TEXT,
+    generated_tests_json TEXT DEFAULT '[]'
 );
 """
 
@@ -225,3 +246,63 @@ def mock_groq_km():
     km = MagicMock()
     km.get_key.return_value = key
     return km
+
+
+# ---------------------------------------------------------------------------
+# V2 Fixtures — classified/interactive problems
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def sample_interactive_problem(tmp_progress_db):
+    """Insert a problem classified as interactive."""
+    import synapse.database as db
+    with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO problems (id, status, rating, problem_class) VALUES (?, ?, ?, ?)",
+            ("1000A", "pending_ingestion", 1200, "interactive"),
+        )
+        conn.commit()
+    return {"id": "1000A", "rating": 1200, "problem_class": "interactive"}
+
+
+@pytest.fixture
+def sample_special_judge_problem(tmp_progress_db):
+    """Insert a problem classified as special_judge."""
+    import synapse.database as db
+    with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO problems (id, status, rating, problem_class) VALUES (?, ?, ?, ?)",
+            ("1001B", "pending_ingestion", 1800, "special_judge"),
+        )
+        conn.commit()
+    return {"id": "1001B", "rating": 1800, "problem_class": "special_judge"}
+
+
+@pytest.fixture
+def sample_problem_with_generator(tmp_progress_db, tmp_workspace_db):
+    """Problem with workspace data including a fuzz test generator script."""
+    import synapse.database as db
+    pretests = [{"input": "3\n1 2 3", "output": "6"}]
+    generator_py = "import random\nn=random.randint(1,10)\nprint(n)\nprint(*[random.randint(1,100) for _ in range(n)])"
+    with db._get_db_connection(db.PROGRESS_DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO problems (id, status, rating) VALUES (?, ?, ?)",
+            ("2066B", "pending_vjs", 1500),
+        )
+        conn.commit()
+    with db._get_db_connection(db.WORKSPACE_DB_PATH) as conn:
+        conn.execute(
+            """INSERT INTO problem_data_cache (
+                problem_id, problem_statement_html, pretests_json,
+                validated_pretests_json, reference_solution_code,
+                input_generator_py, time_limit_raw, memory_limit_raw
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "2066B", "<p>Sum array</p>",
+                json.dumps(pretests), json.dumps(pretests),
+                "#include<bits/stdc++.h>\nusing namespace std;\nint main(){long long s=0,n,x;cin>>n;while(n--){cin>>x;s+=x;}cout<<s;}",
+                generator_py, "2 seconds", "256 megabytes",
+            ),
+        )
+        conn.commit()
+    return {"id": "2066B", "rating": 1500}
