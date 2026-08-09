@@ -1,220 +1,377 @@
 # Project Synapse 🧠
 
-**Status:** Completed  
-**Description:** A resilient, self-tuning, multi-stage data pipeline for building high-fidelity datasets from competitive programming platforms.
+> A resilient, self-tuning, **distributed** multi-stage data pipeline for building high-fidelity AI training datasets from competitive programming platforms.
 
-## Overview
-
-Project Synapse is an automated pipeline designed to solve a complex data collection problem: generating a verified, high-quality dataset of programming problems, solutions, and their logical representations (pseudocode). It orchestrates a series of workers that scrape data, use LLMs for analysis and code generation, and run a local sandboxed judge for verification.
-
-The system is built with a "Patient Resilience" philosophy, emphasizing fault tolerance, graceful error handling, and the ability to run for extended periods without supervision. Its most advanced feature is a self-tuning `optimizer` that monitors the pipeline's health and dynamically adjusts parameters like worker counts and batch sizes to maintain stability and performance.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Docker](https://img.shields.io/badge/docker-required-blue.svg)](https://www.docker.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 ---
 
-## Architecture
+## What is Synapse?
 
-The pipeline operates as a decoupled, multi-stage system where problems flow from one status to the next. Two SQLite databases (`progress.db` and `workspace.db`) manage the state and temporary data for the entire system. The orchestrator (`main.py`) dispatches jobs to workers running in separate thread pools.
+Synapse solves a hard data problem: **generating a verified, high-quality dataset of competitive programming problems** where every entry contains a problem statement, multiple oracle C++ solutions, language-agnostic pseudocode, a reconstructed implementation, and proof of correctness via a live judge.
 
+The pipeline is designed for **unattended, long-running operation** — you start it, and it runs until it's done (or you stop it). A built-in `optimizer` module monitors health metrics and dynamically tunes worker counts and batch sizes using AIMD control loops.
 
+### Sample Output (Golden Record)
 
-The data flows through the following stages:
+→ See [`Records/809B_golden_record.json`](./Records/809B_golden_record.json) for a full example of what the pipeline produces per problem.
 
-1.  **Ingestion:** A hybrid scraper fetches problem details. It uses `requests` for public data and an authenticated Selenium browser for protected content (like solution source code).
-2.  **Analysis (ARL):** A batch of problems is sent to an "Analyst" LLM (e.g., Gemini 1.5 Pro) to convert the reference C++ solution into language-agnostic pseudocode. This stage is batch-capable to respect API rate limits.
-3.  **Implementation (ARL):** The generated pseudocode is sent to an "Implementer" LLM (e.g., Llama 3 on Groq) to reconstruct the C++ code. This stage is optimized for high speed.
-4.  **Verification (VJS):** The reconstructed code is compiled and run inside a secure Docker container against all known pretests. The VJS enforces strict time and memory limits.
-    * **Success:** The problem proceeds to the next stage.
-    * **Compile Error:** The compiler error is fed back to the *Implementer* for a syntax fix.
-    * **Logic/Runtime Error:** A detailed failure report is fed back to the *Analyst* to correct the core algorithm.
-5.  **Data Assembly:** Once a problem passes verification, a final "golden record" is assembled, including code quality metrics (Cyclomatic Complexity, etc.), and appended to `dataset.jsonl`. All intermediate data is then deleted to conserve space.
+---
+
+## Architecture (v2 — Distributed)
+
+Synapse v2 uses a **hybrid two-node deployment**:
+
+| Node | Role | Entrypoint |
+|------|------|-----------|
+| **Laptop** | Ingestion — Selenium scraping of Codeforces (auth-required pages) | `ingestion_node.py` |
+| **DGX / Server** | Processing — all compute-heavy stages (Calibration → Assembly) | `main.py` via Docker Compose |
+
+Both nodes share a **PostgreSQL 16** database as the message bus. The laptop writes scraped problem data; the DGX reads and processes it. An SSH tunnel bridges them.
+
+### Pipeline Stages
+
+```
+[LAPTOP]  ① Ingestion  ──────────── scrape CF problems + classify
+                │
+[DGX]     ② Calibration ─────────── compile & run N oracle solutions
+                │                    establish timing baselines (VJS)
+          ③ Analysis ──────────────  Gemini: C++ oracle → pseudocode (batch)
+                │
+          ④ Fuzz Generation ───────  Gemini: generate adversarial test cases
+                │
+          ⑤ Implementation ────────  Groq/DeepSeek: pseudocode → C++
+                │
+          ⑥ VJS (local judge) ─────  Docker sandbox: compile & judge vs oracles
+                │       ↑               ┌─ Compile Error → ⑤ Implementer (syntax fix)
+                │       └───────────────┤
+                │                       └─ Logic Error → ③ Analyst (algorithm fix)
+          ⑦ CF Submission ──────────  submit to Codeforces judge (live validation)
+                │
+          ⑧ Data Assembly ─────────  assemble golden record → dataset.jsonl
+```
 
 ### Key Components
 
-* **Databases:**
-    * `progress.db`: The "single source of truth." Tracks the status of every problem, worker activity, performance metrics, and dynamic configuration. Uses WAL mode for high concurrency.
-    * `workspace.db`: A transient cache for intermediate data like HTML, scraped code, and LLM outputs for problems currently being processed.
-* **Optimizer (`optimizer.py`):** A separate process that acts as the pipeline's "brain." It reads the `metrics` table and uses control algorithms (like AIMD) to adjust parameters in the `dynamic_config` table to respond to events like API rate-limiting or queue overflows.
-* **Dashboard (`status.py`):** A terminal-based live dashboard that provides a real-time overview of all pipeline queues, worker activity, and optimizer levers.
-
----
-
-## Features
-
-* **Resilient & Resumable:** The entire pipeline is stateful. You can stop and restart it at any time, and it will pick up exactly where it left off.
-* **Self-Tuning:** The `optimizer.py` process automatically adjusts pipeline parameters to prevent API rate limit errors and balance workloads between stages.
-* **Intelligent Retry Logic:** The pipeline can distinguish between syntax errors and logic errors, routing failed jobs back to the appropriate LLM with structured feedback for self-correction.
-* **Hybrid Scraping:** Minimizes the use of resource-heavy browsers by using lightweight `requests` for the majority of scraping tasks.
-* **Local Verification Sandbox:** Uses Docker to create a secure, consistent environment for compiling and judging code, preventing any risk to the host machine.
-* **Data Enrichment:** Automatically runs static and semantic analysis on both the reference and verified solutions, adding valuable code quality metrics to the final dataset.
+| Component | File | Description |
+|-----------|------|-------------|
+| **Orchestrator** | [`main.py`](./main.py) | Manages 8 stage thread pools with dynamic resizing |
+| **Ingestion Node** | [`ingestion_node.py`](./ingestion_node.py) | Laptop-only: Selenium scraper entry point |
+| **Config** | [`config.py`](./config.py) | All constants, limits, and default parameters |
+| **DB Init** | [`create_database.py`](./create_database.py) | One-time schema creation (SQLite or PostgreSQL) |
+| **Dashboard** | [`status.py`](./status.py) | Live `rich`-based terminal dashboard |
+| **DAL** | [`synapse/database.py`](./synapse/database.py) | Data Access Layer — all SQL behind clean functions |
+| **Key Manager** | [`synapse/key_manager.py`](./synapse/key_manager.py) | Intelligent API key rotation with rate-limit tracking |
+| **Account Manager** | [`synapse/account_manager.py`](./synapse/account_manager.py) | Multi-account Codeforces session management |
+| **API Clients** | [`synapse/api_clients.py`](./synapse/api_clients.py) | Gemini + Groq client wrappers with retry logic |
+| **Scraper** | [`synapse/scraper.py`](./synapse/scraper.py) | Hybrid `requests` + `undetected-chromedriver` scraper |
+| **VJS** | [`synapse/vjs.py`](./synapse/vjs.py) | Docker-based compilation + judging subsystem |
+| **Optimizer** | [`synapse/optimizer.py`](./synapse/optimizer.py) | AIMD control loops — auto-tunes worker counts |
+| **Checker** | [`synapse/checker.py`](./synapse/checker.py) | Output comparison for custom-checker problems |
+| **Stats Monitor** | [`synapse/stats_monitor.py`](./synapse/stats_monitor.py) | Scraper & API telemetry aggregation |
 
 ---
 
 ## Tech Stack
 
-* **Orchestration:** Python 3.10+
-* **Concurrency:** `concurrent.futures.ThreadPoolExecutor`
-* **Databases:** SQLite 3
-* **LLM APIs:** Google Gemini, Groq
-* **Web Scraping:** `requests`, `BeautifulSoup4`, `undetected-chromedriver`
-* **Verification Sandbox:** Docker
-* **Data Versioning:** DVC (Data Version Control)
-* **Dashboard:** `rich`
-* **Code Quality:** `lizard`, `cppcheck`
+| Layer | Technology |
+|-------|-----------|
+| **Orchestration** | Python 3.10+ `ThreadPoolExecutor` per stage |
+| **Database** | PostgreSQL 16 (production) / SQLite 3 WAL (dev/local) |
+| **Analyst LLM** | Google Gemini 2.5 Pro (structured JSON output, batch API) |
+| **Implementer LLM** | Groq — DeepSeek-V3.2 / Llama 3 |
+| **Web Scraping** | `requests`, `BeautifulSoup4`, `undetected-chromedriver` |
+| **Judge Sandbox** | Docker (`synapse-judge` image, `g++ -O2 -std=c++23`) |
+| **Self-Tuning** | AIMD control loops in `optimizer.py` |
+| **Deployment** | Docker Compose (DGX), SSH tunnel, Makefile |
+| **Code Metrics** | `lizard` (Cyclomatic Complexity) |
+| **Data Versioning** | DVC (Data Version Control) |
+| **Dashboard** | `rich` |
 
 ---
 
-## Setup and Installation
+## Setup & Installation
 
-**Prerequisites:**
-* Git
-* Python 3.10+ and `pip`
-* Docker Desktop (must be running)
-* Google Chrome
+### Prerequisites
 
-**1. Clone the Repository**
+- Git
+- Python 3.10+
+- Docker (running — for VJS sandbox)
+- Google Chrome (laptop node only — for Selenium scraping)
+- SSH access to DGX/server (for distributed deployment)
+
+### 1. Clone the Repository
+
 ```bash
-git clone [https://github.com/your-username/axe-08-synapse.git](https://github.com/your-username/axe-08-synapse.git)
-cd axe-08-synapse
-````
+git clone https://github.com/Axe-08/Synapse.git
+cd Synapse
+git checkout develop
+```
 
-**2. Install Dependencies**
+### 2. Create a Virtual Environment
 
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### 3. Install Dependencies
+
+**Laptop node** (full — includes Selenium, DVC):
 ```bash
 pip install -r requirements.txt
 ```
 
-**3. Configure Environment Variables**
-Create a `.env` file in the project root and add your credentials:
+**DGX / server node** (pipeline only — no Selenium/DVC):
+```bash
+pip install -r requirements-pipeline.txt
+```
+
+### 4. Configure Environment Variables
+
+Create a `.env` file in the project root:
 
 ```env
 # .env
-GEMINI_API_KEYS=your_gemini_api_key_1,your_gemini_api_key_2
-GROQ_API_KEYS=your_groq_api_key_1,your_groq_api_key_2
 
-# Codeforces Login
-CF_HANDLE=your_codeforces_handle
-CF_PASSWORD=your_codeforces_password
+# LLM API Keys (comma-separated for multi-key rotation)
+GEMINI_API_KEYS=your_gemini_key_1,your_gemini_key_2
+GROQ_API_KEYS=your_groq_key_1,your_groq_key_2
 
-# A custom user agent for respectful scraping
+# Codeforces Login Credentials (multiple accounts supported)
+CF_ACCOUNTS=[{"handle": "user1", "password": "pass1"}, {"handle": "user2", "password": "pass2"}]
+
+# Respectful scraping user-agent
 MY_USER_AGENT=YourName/ProjectSynapse/1.0 (your.email@example.com)
+
+# PostgreSQL connection (required for distributed mode; SSH tunnel must be open)
+# DATABASE_URL=postgresql://synapse:synapse@localhost:5432/synapse_db
+
+# Set to true on the DGX node to disable Selenium ingestion
+# DISABLE_INGESTION=true
 ```
 
-**4. Build the VJS Docker Image**
-This command creates the `synapse-judge` image used for code verification.
+### 5. Build the VJS Docker Image
+
+This creates the `synapse-judge` container used for code compilation and judging:
 
 ```bash
 docker build -t synapse-judge .
 ```
 
-**5. Initialize the Databases**
-This script will fetch the complete Codeforces problem list and set up the pipeline's initial state.
+### 6. Initialise the Database
 
+**Local SQLite (development):**
 ```bash
 python create_database.py
 ```
 
-*You will be prompted to confirm if databases already exist.*
-
-**6. (Optional) Configure DVC Remote Storage**
-To back up your final dataset, configure a DVC remote (e.g., Google Drive).
-
+**PostgreSQL (production — run after opening tunnel):**
 ```bash
-# Follow instructions from DVC for your chosen cloud storage
-dvc remote add -d myremote gdrive://<your_gdrive_folder_id>
+make init-db
 ```
 
------
+---
 
-## Usage
+## Running the Pipeline
 
-The pipeline is designed to be run as three separate, long-running processes in different terminal windows.
+### Local Mode (SQLite, single machine)
 
-**Terminal 1: Run the Main Orchestrator**
-This is the core of the pipeline. It starts all the worker threads.
+Run each in a separate terminal:
 
 ```bash
+# Terminal 1 — Main orchestrator (all stages including ingestion)
 python main.py
-```
 
-**Terminal 2: Run the Optimizer**
-This process will monitor the pipeline and tune its parameters.
-
-```bash
-python synapse/optimizer.py
-```
-
-**Terminal 3: Run the Status Dashboard**
-This will display a live, full-screen dashboard of the system's status.
-
-```bash
+# Terminal 2 — Live dashboard
 python status.py
 ```
 
------
-
-## Finalizing and Versioning the Dataset
-
-Once the pipeline has processed a significant number of problems, the `dataset.jsonl` file will contain your final output.
-
-**1. Track with DVC**
-Use `dvc add` to have DVC start tracking the file's hash.
+### Distributed Mode (Laptop + DGX)
 
 ```bash
+# ── LAPTOP ─────────────────────────────────────────────
+# Step 1: Open SSH tunnel to DGX PostgreSQL
+make tunnel                        # runs in background
+
+# Step 2: Run ingestion (scrapes CF, writes to shared PG)
+python ingestion_node.py
+
+# ── DGX ────────────────────────────────────────────────
+# Step 3: Pull latest code on DGX
+make dgx-pull
+
+# Step 4: Start the pipeline containers (PostgreSQL + pipeline)
+make dgx-up
+
+# Step 5: Check logs
+make dgx-logs
+```
+
+### Useful Makefile Targets
+
+| Target | Description |
+|--------|-------------|
+| `make tunnel` | Open SSH tunnel (laptop → DGX:5432) |
+| `make dgx-pull` | Pull latest git + reinstall deps on DGX |
+| `make dgx-up` | `docker compose up -d` on DGX |
+| `make dgx-down` | `docker compose down` on DGX |
+| `make dgx-logs` | Tail pipeline logs |
+| `make init-db` | Initialise PostgreSQL schema (via tunnel) |
+| `make init-db-local` | Initialise local SQLite schema |
+| `make test` | Run unit + integration tests |
+
+---
+
+## Testing
+
+The test suite covers unit, integration, and end-to-end tiers:
+
+```bash
+# Run all fast tests (unit + integration)
+make test
+
+# Or directly:
+venv/bin/python -m pytest tests/unit/ tests/integration/ -q
+
+# Run only unit tests
+pytest tests/unit/ -m unit
+
+# Run integration tests (needs in-memory DB)
+pytest tests/integration/ -m integration
+
+# E2E tests (requires real API keys + Docker — slow)
+pytest tests/e2e/ -m e2e
+```
+
+---
+
+## Versioning the Dataset
+
+Once the pipeline has processed problems, version the output with DVC:
+
+```bash
+# Track the dataset file
 dvc add dataset.jsonl
-```
 
-**2. Commit the Changes**
-Commit the resulting `dataset.jsonl.dvc` file to Git. This small pointer file represents the specific version of your dataset.
-
-```bash
+# Commit the DVC pointer
 git add dataset.jsonl.dvc .gitignore
-git commit -m "feat: version final dataset"
-```
+git commit -m "feat: version dataset snapshot"
 
-**3. Push to Remote Storage**
-Push the actual data file to your configured remote storage.
-
-```bash
+# Push data to remote storage (configure first)
 dvc push
 ```
 
-Your dataset is now versioned and backed up.
-
------
+---
 
 ## Directory Structure
 
 ```
-axe-08-synapse/
-├── .dvc/
-├── .dvcignore
-├── config.py                 # Static configuration and constants
-├── create_database.py        # One-time script to initialize databases
-├── dataset.jsonl.dvc         # DVC pointer to the final dataset
-├── debug_pipeline.py         # Sequential debugger for the pipeline
-├── Dockerfile                # Defines the VJS sandbox environment
-├── llm.txt                   # Master context prompt for development
-├── main.py                   # Main orchestrator entry point
-├── plan.md                   # Project implementation plan
-├── requirements.txt
-├── status.py                 # Live terminal dashboard
-└── synapse/
-    ├── __init__.py
-    ├── api_clients.py        # Manages calls to external LLM APIs
-    ├── config_manager.py     # Singleton for managing dynamic config
-    ├── data_assembly.py      # Assembles the final golden record
-    ├── data_manager.py       # Handles writing to the final dataset file
-    ├── database.py           # Data Access Layer (DAL) for databases
-    ├── database_writer.py    # Dedicated async writer thread for SQLite
-    ├── key_manager.py        # Intelligent API key and rate-limit management
-    ├── optimizer.py          # Self-tuning "brain" of the pipeline
-    ├── scraper.py            # Hybrid web scraper for Codeforces
-    ├── vjs.py                # Verification & Judging Subsystem (Docker-based)
-    └── workers.py            # Core logic for each pipeline stage
+Synapse/
+├── main.py                    # Main orchestrator — 8-stage pipeline (DGX)
+├── ingestion_node.py          # Laptop-only ingestion entry point
+├── status.py                  # Live terminal dashboard (rich)
+├── create_database.py         # One-time DB initialisation
+├── config.py                  # All constants and defaults
+├── Makefile                   # DGX deployment helpers
+├── Dockerfile                 # synapse-judge sandbox (GCC 15, C++23)
+├── Dockerfile.pipeline        # Python pipeline image for DGX
+├── docker-compose.yml         # DGX: PostgreSQL + pipeline services
+├── requirements.txt           # Full deps (laptop)
+├── requirements-pipeline.txt  # Minimal deps (DGX, no Selenium/DVC)
+├── pytest.ini                 # Test configuration
+├── dataset.jsonl.dvc          # DVC pointer to final dataset
+│
+├── synapse/                   # Core library
+│   ├── database.py            # Data Access Layer (DAL)
+│   ├── database_writer.py     # Dedicated async SQLite writer thread
+│   ├── api_clients.py         # Gemini + Groq client wrappers
+│   ├── key_manager.py         # API key rotation + rate-limit tracking
+│   ├── account_manager.py     # Multi-account Codeforces sessions
+│   ├── scraper.py             # Hybrid requests + Selenium scraper
+│   ├── vjs.py                 # Docker-based judge subsystem
+│   ├── optimizer.py           # AIMD self-tuning optimizer
+│   ├── config_manager.py      # DB-backed dynamic config singleton
+│   ├── data_assembly.py       # Golden record assembly logic
+│   ├── data_manager.py        # JSONL dataset writer
+│   ├── checker.py             # Custom output checker
+│   ├── stats_monitor.py       # Scraper + API telemetry
+│   └── workers/               # One module per pipeline stage
+│       ├── ingestion.py       # Stage 1: scrape + classify
+│       ├── calibration.py     # Stage 2: multi-oracle VJS calibration
+│       ├── analysis.py        # Stage 3: Gemini pseudocode generation
+│       ├── fuzz_generator.py  # Stage 4: adversarial test generation
+│       ├── implementation.py  # Stage 5: Groq code reconstruction
+│       ├── vjs.py             # Stage 6: local Docker judge
+│       ├── cf_submission.py   # Stage 7: Codeforces live submission
+│       └── data_assembly.py   # Stage 8: assemble + write golden record
+│
+├── scripts/                   # Utility & debug scripts
+│   ├── debug_pipeline.py      # Sequential single-problem debugger
+│   ├── debug_pipeline_v2.py   # v2 debugger with cache replay
+│   ├── api_key_checker.py     # Validate all API keys
+│   ├── cf_accounts_check.py   # Verify Codeforces account health
+│   ├── scraper_health_check.py # Run scraper diagnostics
+│   ├── run_scraper_all_accounts.py # Bulk scrape with account rotation
+│   ├── mock_scraper_from_dataset.py # Replay scraping from cached data
+│   ├── process_logs.py        # Parse and summarise debug logs
+│   └── dump_all_golden.py     # Export all golden records to JSON
+│
+├── tests/                     # Test suite
+│   ├── unit/                  # Pure unit tests (no I/O)
+│   ├── integration/           # In-memory DB + mocked APIs
+│   └── e2e/                   # Full pipeline (real keys + Docker)
+│
+├── debugging_and_testing/     # Debug DB snapshots and helpers
+│
+├── Records/                   # Sample golden record outputs
+│   └── README.md              # Golden record format documentation
+│
+└── Documents/                 # Architecture & specifications
+    ├── SRS.md                 # SRS v1.0 (original architecture)
+    ├── SRS_v2.md              # SRS v2.0 (multi-oracle, distributed)
+    ├── TestPlan.md            # Test plan + debug guide
+    ├── Architecture.md        # Architecture overview + quick ref
+    └── Diagrams/              # Mermaid source + wireframe images
+        ├── Mermaid/           # 7 Mermaid diagram files
+        └── Wireframes/        # Visual wireframe images
 ```
 
------
+---
+
+## Key Design Decisions
+
+### Patient Resilience
+The entire pipeline is **stateful and resumable**. Every problem's journey is tracked in the database. Stop the pipeline at any time — restart it and it picks up exactly where it left off.
+
+### N-Version Programming (Multi-Oracle)
+Instead of trusting a single reference solution, Synapse scrapes **N top-rated solutions** (default: 5) for each problem. The VJS calibrates against all of them and only proceeds if at least `MIN_VIABLE_ORACLES` (default: 3) compile and produce consistent outputs.
+
+### Self-Tuning Optimizer (AIMD)
+The `optimizer.py` runs in a background thread and uses **Additive Increase / Multiplicative Decrease** (same algorithm TCP uses for congestion control) to tune:
+- Worker counts per stage
+- API batch sizes
+- Scraper delays
+
+It responds to events like API rate-limit errors, queue overflows, and idle workers — keeping the pipeline balanced without manual intervention.
+
+### Intelligent Retry Routing
+When VJS fails, the pipeline classifies the failure:
+- **Compile Error** → routed back to the **Implementer** LLM (syntax fix)
+- **Logic/Runtime Error** → routed back to the **Analyst** LLM (algorithm fix)
+
+This self-correction loop significantly increases the final pass rate without human intervention.
+
+---
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the [MIT License](./LICENSE).
+
+---
+
+## Author
+
+Built by [Axe-08](https://github.com/Axe-08) as a research data engineering project.
